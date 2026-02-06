@@ -853,10 +853,9 @@ void SceneRenderAll(PyMOLGlobals* G, SceneUnitContext* context, float* normal,
     auto disregard_gizmo = !static_cast<bool>(
         which_objects_int &
         std::underlying_type_t<SceneRenderWhich>(SceneRenderWhich::Gizmos));
-    if (which_objects_int &
-        std::underlying_type_t<SceneRenderWhich>(SceneRenderWhich::All)) {
+    if (which_objects == SceneRenderWhich::All) {
       switch (render_order) {
-      case SceneRenderOrder::Undefined:
+      case SceneRenderOrder::Arbitrary:
         for (auto obj : I->Obj) {
           /* EXPERIMENTAL RAY-VOLUME COMPOSITION CODE */
           if (obj->type == cObjectGizmo && disregard_gizmo) {
@@ -885,14 +884,17 @@ void SceneRenderAll(PyMOLGlobals* G, SceneUnitContext* context, float* normal,
         }
         break;
       } // end render order for all objects
-    } else if (which_objects_int & std::underlying_type_t<SceneRenderWhich>(
-                                       SceneRenderWhich::Gadgets)) {
+    } else if (which_objects == SceneRenderWhich::GizmosAndGadgets) {
       for (auto obj : I->GadgetObjs) {
         if (obj->type == cObjectGizmo && disregard_gizmo) {
           continue;
         }
+        // Temporarily switch renderpass as opaque in order for Gizmos to not be
+        // rendered with t_mode3 shader derivatives
+        info.pass = RenderPass::Opaque;
         SceneRenderAllObject(
             G, I, context, &info, normal, state, obj, grid, slot_vla, fat);
+        info.pass = RenderPass::Transparent;
       }
     } else if (which_objects_int & std::underlying_type_t<SceneRenderWhich>(
                                        SceneRenderWhich::NonGadgets)) {
@@ -928,7 +930,7 @@ void SceneRenderAll(PyMOLGlobals* G, SceneUnitContext* context, float* normal,
 static void DoRendering(PyMOLGlobals* G, CScene* I, GridInfo* grid, int times,
     int curState, float* normal, SceneUnitContext* context, float width_scale,
     bool onlySelections, bool excludeSelections, SceneRenderWhich which_objects = SceneRenderWhich::All,
-    SceneRenderOrder render_order = SceneRenderOrder::Undefined)
+    SceneRenderOrder render_order = SceneRenderOrder::GadgetsLast)
 {
   const RenderPass passes[] = {
       RenderPass::Opaque, RenderPass::Antialias, RenderPass::Transparent};
@@ -1035,7 +1037,7 @@ static void DoRendering(PyMOLGlobals* G, CScene* I, GridInfo* grid, int times,
             auto nonGadgetsFilter =
                 static_cast<SceneRenderWhich>(nonGadgetsFilter_i);
             SceneRenderAll(G, context, normal, NULL, pass, false, width_scale,
-                grid, times, nonGadgetsFilter, SceneRenderOrder::Undefined); // opaque
+                grid, times, nonGadgetsFilter, SceneRenderOrder::GadgetsLast); // opaque
           } else {
 #else
           {
@@ -1064,7 +1066,7 @@ static void DoRendering(PyMOLGlobals* G, CScene* I, GridInfo* grid, int times,
           auto gadgetsFilter = static_cast<SceneRenderWhich>(gadgetsFilter_i);
           SceneRenderAll(G, context, normal, nullptr,
               RenderPass::Transparent /* gadgets render in transp pass */,
-              false, width_scale, grid, times, gadgetsFilter, SceneRenderOrder::Undefined);
+              false, width_scale, grid, times, gadgetsFilter, SceneRenderOrder::GadgetsLast);
           glDisable(GL_BLEND);
         }
 #ifdef PURE_OPENGL_ES_2
@@ -1137,14 +1139,13 @@ static void DoRendering(PyMOLGlobals* G, CScene* I, GridInfo* grid, int times,
         if ((currentDrawFramebuffer == G->ShaderMgr->defaultBackbuffer.framebuffer) &&
             t_mode_3) {
           auto gadgetsFilter_i =
-              pymol::to_underlying(which_objects) &
-              pymol::to_underlying(SceneRenderWhich::Gadgets);
+              pymol::to_underlying(SceneRenderWhich::GizmosAndGadgets);
           auto gadgetsFilter = static_cast<SceneRenderWhich>(gadgetsFilter_i);
           // onlySelections and t_mode_3, render only gadgets
           SceneRenderAll(G, context, normal, nullptr,
               RenderPass::Transparent /* gadgets render in transp pass */,
               false, width_scale, grid, times, gadgetsFilter,
-              SceneRenderOrder::Undefined);
+              SceneRenderOrder::GadgetsLast);
         }
 
         glDisable(GL_BLEND);
@@ -1165,10 +1166,10 @@ static void DoRendering(PyMOLGlobals* G, CScene* I, GridInfo* grid, int times,
             }
           }
         }
-      }
+      } // if transparent w/ t_mode_3
 #endif
-    }
-  }
+    } // for grid
+  } // for pass
   if (grid->active)
     GridSetViewport(G, grid, -1);
 }

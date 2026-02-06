@@ -29,11 +29,12 @@ enum class SceneRenderWhich {
   NonGadgets = 1 << 0,
   Gadgets = 1 << 1,
   Gizmos = 1 << 2,
+  GizmosAndGadgets = Gizmos | Gadgets,
   All = NonGadgets | Gadgets | Gizmos,
 };
 
 enum class SceneRenderOrder {
-  Undefined, // Arbitrary order
+  Arbitrary,
   GadgetsLast,
 };
 
