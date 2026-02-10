@@ -521,6 +521,35 @@ class TestCreating(testing.PyMOLTestCase):
         self.assertEqual(1, cmd.count_atoms('name PS1'))
         self.assertEqual(1, cmd.count_atoms('name PS2'))
 
+    def testRampMapBoundary(self):
+
+        # Test for partial ramp map boundary
+
+        cmd.viewport(100, 100)
+
+        # Long peptide so the surface extends well beyond a partial map
+        cmd.fab('AAAAAAAAAA', 'mol')
+        cmd.set('gaussian_b_floor', 30)
+
+        # Map covers only the first residue
+        cmd.map_new('partial_map', selection='resi 1', buffer=3.0)
+
+        # Solid green ramp spanning the map's value range
+        cmd.ramp_new('ramp1', 'partial_map', [-1, 10, 20],
+                     ['green', 'green', 'green'])
+
+        cmd.show_as('surface', 'mol')
+        cmd.set('surface_color', 'ramp1', 'mol')
+        cmd.disable('ramp1')
+        self.ambientOnly()
+
+        # View the whole molecule: should have green (in-bounds)
+        # and white (out-of-bounds default) regions
+        cmd.orient('mol')
+        img = self.get_imagearray(width=100, height=100)
+        self.assertImageHasColor('green', img)
+        self.assertImageHasColor('white', img)
+
     @testing.requires_version('2.3')
     def test_set_raw_alignment(self):
         cmd.fab('ACDEF', 'm1')

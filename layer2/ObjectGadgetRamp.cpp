@@ -495,8 +495,13 @@ int ObjectGadgetRampInterVertex(
         src_state = SceneGetState(I->G);
       if (ok)
         ok = (I->Map != nullptr);
-      if (ok)
-        ok = ObjectMapInterpolate(I->Map, src_state, pos, &level, nullptr, 1);
+      if (ok) {
+        std::uint8_t inside{};
+        ok = ObjectMapInterpolate(I->Map, src_state, pos, &level, &inside, 1);
+        if (!inside) {
+          ok = false;
+        }
+      }
       if (ok)
         ok = ObjectGadgetRampInterpolate(I, level, color);
     }
