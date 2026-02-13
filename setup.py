@@ -508,23 +508,28 @@ class install_pymol(install):
 
         with open(launch_script, "w") as out:
             if WIN:
-                # paths relative to launcher, if possible
-                try:
-                    python_exe = "%~dp0\\" + os.path.relpath(
-                        python_exe, self.install_scripts
-                    )
-                except ValueError:
-                    pass
-                try:
-                    pymol_file = "%~dp0\\" + os.path.relpath(
-                        pymol_file, self.install_scripts
-                    )
-                except ValueError:
-                    pymol_file = os.path.abspath(pymol_file)
-
                 if not self.pymol_path_is_default:
                     out.write(f"set PYMOL_PATH={pymol_path}" + os.linesep)
-                out.write('"%s" "%s"' % (python_exe, pymol_file))
+
+                if is_mingw:
+                    python_exe = "%~dp0\\python.exe"
+                    out.write('"%s" -m pymol' % python_exe)
+                else:
+                    # paths relative to launcher, if possible
+                    try:
+                        python_exe = "%~dp0\\" + os.path.relpath(
+                            python_exe, self.install_scripts
+                        )
+                    except ValueError:
+                        pass
+                    try:
+                        pymol_file = "%~dp0\\" + os.path.relpath(
+                            pymol_file, self.install_scripts
+                        )
+                    except ValueError:
+                        pymol_file = os.path.abspath(pymol_file)
+                    out.write('"%s" "%s"' % (python_exe, pymol_file))
+
                 out.write(" %*" + os.linesep)
             else:
                 out.write("#!/bin/sh" + os.linesep)
