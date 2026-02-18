@@ -127,7 +127,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
 
         self.ext_window = dockWidget = QtWidgets.QDockWidget(self)
         dockWidget.setObjectName("assistant_chat_dock")
-        dockWidget.setWindowTitle("Assistant Chat")
+        dockWidget.setWindowTitle("PyMolAI")
         dockWidget.setWidget(self.chat_panel)
         dockWidget.setAllowedAreas(Qt.LeftDockWidgetArea)
         dockWidget.setFeatures(QtWidgets.QDockWidget.DockWidgetClosable)
@@ -243,7 +243,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
 
         # assistant chat controls
         menu = self.menudict['Display'].addSeparator()
-        menu = self.menudict['Display'].addMenu('Assistant Chat')
+        menu = self.menudict['Display'].addMenu('PyMolAI')
 
         ext_vis_action = self.ext_window.toggleViewAction()
         ext_vis_action.setText('Visible')
@@ -251,7 +251,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         menu.addAction('Focus Input', self.chat_panel.focus_input).setShortcut(
             QtGui.QKeySequence('Ctrl+E'))
 
-        ai_menu = self.menudict['Display'].addMenu('AI Assistant')
+        ai_menu = self.menudict['Display'].addMenu('PyMolAI Settings')
         ai_reasoning_action = ai_menu.addAction('Show Reasoning')
         ai_reasoning_action.setCheckable(True)
         runtime = self.get_ai_runtime(create=True)

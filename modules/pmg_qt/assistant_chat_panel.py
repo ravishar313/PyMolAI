@@ -284,10 +284,6 @@ class AssistantChatPanel(QtWidgets.QWidget):
 
         header.addStretch(1)
 
-        self.mode_badge = QtWidgets.QLabel("AI")
-        self.mode_badge.setObjectName("chatModeBadge")
-        header.addWidget(self.mode_badge)
-
         self.clear_button = QtWidgets.QPushButton("Clear")
         self.clear_button.clicked.connect(self.clearRequested.emit)
         header.addWidget(self.clear_button)
@@ -332,16 +328,6 @@ class AssistantChatPanel(QtWidgets.QWidget):
             AssistantChatPanel {
                 background: #1f1f1f;
             }
-            QLabel#chatModeBadge {
-                color: #04162f;
-                background: #4ea1ff;
-                border-radius: 9px;
-                font-size: 11px;
-                font-weight: 700;
-                padding: 2px 8px;
-                min-width: 28px;
-                qproperty-alignment: AlignCenter;
-            }
             QPlainTextEdit#chatInput {
                 color: #e8eef7;
                 background: #14171d;
@@ -384,17 +370,9 @@ class AssistantChatPanel(QtWidgets.QWidget):
         normalized = "cli" if str(mode or "").lower() == "cli" else "ai"
         self._mode = normalized
         if normalized == "cli":
-            self.mode_badge.setText("CLI")
-            self.mode_badge.setStyleSheet(
-                "color:#231700;background:#f4b347;border-radius:9px;padding:2px 8px;font-size:11px;font-weight:700;"
-            )
             self.input_edit.setPlaceholderText("CLI mode: type a PyMOL command (Enter to run, Shift+Enter newline)")
         else:
-            self.mode_badge.setText("AI")
-            self.mode_badge.setStyleSheet(
-                "color:#04162f;background:#4ea1ff;border-radius:9px;padding:2px 8px;font-size:11px;font-weight:700;"
-            )
-            self.input_edit.setPlaceholderText("Ask PyMOL assistant... (Enter to send, Shift+Enter newline)")
+            self.input_edit.setPlaceholderText("Ask PyMolAI... (Enter to send, Shift+Enter newline)")
 
     def clear_transcript(self):
         self._active_ai_bubble = None
@@ -473,7 +451,7 @@ class AssistantChatPanel(QtWidgets.QWidget):
             if last_line == clean:
                 return
         if not self._active_ai_bubble:
-            self._active_ai_bubble = MessageBubble("Assistant", kind="assistant", markdown=True)
+            self._active_ai_bubble = MessageBubble("PyMolAI", kind="assistant", markdown=True)
             self._append_widget(self._active_ai_bubble)
         self._active_ai_bubble.append_text(clean)
         self._last_ai_text = clean

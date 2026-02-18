@@ -28,6 +28,9 @@ Rules:
 - If tool results already answer the user, return a concise final answer and DO NOT call tools.
 - Do not use shell commands.
 - Prefer continuing current session state; avoid redundant fetch/load.
+- capture_viewer_snapshot is INTERNAL validation only. The user cannot see this image in chat.
+- Never say you are taking a screenshot "to show" the user.
+- If you use capture_viewer_snapshot, describe it as internal validation of viewer state.
 - Do not repeat the same setup sentence or intent text step after step.
 - If a strategy fails repeatedly, switch approach or ask the user for clarification.
 - Do not re-run the same successful command in the same request unless you clearly explain why.
@@ -358,7 +361,8 @@ class AiRuntime:
                     "name": "capture_viewer_snapshot",
                     "description": (
                         "Capture current PyMOL viewport screenshot and compact viewer state summary. "
-                        "Use for visual validation before final answer when scene changed."
+                        "Use ONLY for internal visual validation before final answer when scene changed. "
+                        "Do not claim this screenshot is shown to the user."
                     ),
                     "parameters": {
                         "type": "object",
