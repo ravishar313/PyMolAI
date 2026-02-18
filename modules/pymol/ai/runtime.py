@@ -137,6 +137,42 @@ class AiRuntime:
         if emit_notice:
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="session memory cleared"))
 
+    def export_session_state(self) -> Dict[str, object]:
+        return {
+            "input_mode": "cli" if self.input_mode == "cli" else "ai",
+            "history": list(self.history[-80:]),
+            "model_info": {
+                "model": self.model,
+                "enabled": bool(self.enabled),
+                "reasoning_visible": bool(self.reasoning_visible),
+                "final_answer_enabled": bool(self.final_answer_enabled),
+            },
+        }
+
+    def import_session_state(self, state: Optional[Dict[str, object]], apply_model: bool = False) -> None:
+        payload = dict(state or {})
+        self._stream_line_buffer = ""
+
+        mode = "cli" if str(payload.get("input_mode") or "").lower() == "cli" else "ai"
+        self.input_mode = mode
+
+        history = payload.get("history") or []
+        if isinstance(history, list):
+            self.history = list(history[-80:])
+        else:
+            self.history = []
+
+        if apply_model:
+            model_info = payload.get("model_info") or {}
+            if isinstance(model_info, dict):
+                model = str(model_info.get("model") or "").strip()
+                if model:
+                    self.model = model
+                if "enabled" in model_info:
+                    self.enabled = bool(model_info.get("enabled"))
+                if "reasoning_visible" in model_info:
+                    self.reasoning_visible = bool(model_info.get("reasoning_visible"))
+
     def emit_ui_event(self, event: UiEvent) -> None:
         if event.role == UiRole.SYSTEM and self._is_internal_system_reminder(event.text):
             return

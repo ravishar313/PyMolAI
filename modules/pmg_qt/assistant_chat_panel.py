@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+from types import SimpleNamespace
 from typing import Optional
 
 from pymol.Qt import QtCore, QtGui, QtWidgets
@@ -275,6 +276,8 @@ class AssistantChatPanel(QtWidgets.QWidget):
     sendCommand = QtCore.Signal(str)
     clearRequested = QtCore.Signal()
     stopRequested = QtCore.Signal()
+    historyRequested = QtCore.Signal()
+    newChatRequested = QtCore.Signal()
     MAX_VISIBLE_CARDS = 200
     AI_FLUSH_INTERVAL_MS = 60
 
@@ -299,6 +302,14 @@ class AssistantChatPanel(QtWidgets.QWidget):
         header = QtWidgets.QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
+
+        self.history_button = QtWidgets.QPushButton("History")
+        self.history_button.clicked.connect(self.historyRequested.emit)
+        header.addWidget(self.history_button)
+
+        self.new_chat_button = QtWidgets.QPushButton("New Chat")
+        self.new_chat_button.clicked.connect(self.newChatRequested.emit)
+        header.addWidget(self.new_chat_button)
 
         header.addStretch(1)
 
@@ -403,6 +414,30 @@ class AssistantChatPanel(QtWidgets.QWidget):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+
+    def replace_transcript(self, events, mode: str):
+        self.clear_transcript()
+        self.set_mode(mode)
+        converted = []
+        for item in events or ():
+            if hasattr(item, "role"):
+                converted.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            converted.append(
+                SimpleNamespace(
+                    role=str(item.get("role", "system")),
+                    text=str(item.get("text", "") or ""),
+                    ok=item.get("ok"),
+                    metadata=dict(item.get("metadata") or {}),
+                )
+            )
+        if converted:
+            self.append_ai_events(converted)
+            self._flush_pending_ai_text()
+            self._active_ai_bubble = None
+            self._scroll_to_bottom()
 
     def append_feedback_block(self, text: str):
         if not text:
@@ -514,3 +549,6 @@ class AssistantChatPanel(QtWidgets.QWidget):
     def _scroll_to_bottom(self):
         bar = self.scroll.verticalScrollBar()
         QtCore.QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
+
+    def history_anchor_widget(self):
+        return self.history_button

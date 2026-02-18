@@ -17,9 +17,12 @@ from pymol.Qt.utils import (getSaveFileNameWithExt, UpdateLock,
         MainThreadCaller,
         PopupOnException,
         )
+from pymol.ai.message_types import UiEvent, UiRole
 
 from .pymol_gl_widget import PyMOLGLWidget
 from .assistant_chat_panel import AssistantChatPanel
+from .ai_chat_store import AiChatStore
+from .ai_chat_history_popup import ChatHistoryPopup, ChatHistoryManagerDialog
 from . import keymapping
 
 from pmg_qt import properties_dialog, file_dialogs
@@ -55,6 +58,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             self.pymolwidget.pymol.button(*args)
 
     def closeEvent(self, event):
+        if getattr(self, "_chat_store", None) is not None:
+            self._chat_store.close()
         self.cmd.quit()
 
     # for thread-safe viewport command
@@ -122,8 +127,15 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.chat_panel.sendCommand.connect(self._on_chat_command_submitted)
         self.chat_panel.clearRequested.connect(self._on_chat_clear_requested)
         self.chat_panel.stopRequested.connect(self._on_chat_stop_requested)
+        self.chat_panel.historyRequested.connect(self._on_chat_history_requested)
+        self.chat_panel.newChatRequested.connect(self._on_chat_new_requested)
         self._chat_has_user_input = False
+        self._history_manager_dialog = None
         self.lineedit = self.chat_panel.input_edit
+
+        self._history_popup = ChatHistoryPopup(self._list_chat_rows, self)
+        self._history_popup.chatSelected.connect(self._on_history_chat_selected)
+        self._history_popup.managerRequested.connect(self._open_history_manager)
 
         self.ext_window = dockWidget = QtWidgets.QDockWidget(self)
         dockWidget.setObjectName("assistant_chat_dock")
@@ -144,6 +156,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.setCentralWidget(self.pymolwidget)
 
         cmd = self.cmd = self.pymolwidget.cmd
+        self._chat_store = AiChatStore()
+        self._start_new_chat_session(title_hint="")
 
         '''
         # command completion
@@ -788,6 +802,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             events = runtime.drain_ui_events(limit=batch_size)
             if events:
                 self.chat_panel.append_ai_events(events)
+                self._persist_runtime_events(events, runtime)
             if runtime.has_pending_ui_events():
                 next_feedback_ms = 0
             self.chat_panel.set_mode(runtime.current_input_mode)
@@ -798,7 +813,12 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         if feedback:
             filtered_feedback = self._filter_internal_feedback_lines(feedback)
             if filtered_feedback and self._chat_has_user_input:
-                self.chat_panel.append_feedback_block('\n'.join(str(x) for x in filtered_feedback))
+                block = '\n'.join(str(x) for x in filtered_feedback)
+                self.chat_panel.append_feedback_block(block)
+                self._persist_feedback_block(block)
+
+        if self._chat_store is not None:
+            self._chat_store.pump(self._save_chat_checkpoint)
 
         for setting in self.cmd.get_setting_updates() or ():
             if setting in self.setting_callbacks:
@@ -838,6 +858,11 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         runtime = self.get_ai_runtime(create=False)
         if runtime is not None:
             runtime.clear_session(emit_notice=False)
+        current_id = getattr(self._chat_store, "current_chat_id", None)
+        if current_id:
+            self._chat_store.delete_chat(current_id)
+        self._chat_has_user_input = False
+        self._start_new_chat_session(title_hint="")
         self.feedback_timer.start(0)
 
     def _on_chat_stop_requested(self):
@@ -846,6 +871,210 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             runtime.request_cancel()
         self.cmd.interrupt()
         self.feedback_timer.start(0)
+
+    def _start_new_chat_session(self, title_hint: str = ""):
+        chat_id = self._chat_store.create_chat(title_hint=title_hint)
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            self._chat_store.set_runtime_state(chat_id, runtime.export_session_state())
+
+    def _persist_runtime_events(self, events, runtime):
+        chat_id = getattr(self._chat_store, "current_chat_id", None)
+        if not chat_id:
+            self._start_new_chat_session(title_hint="")
+            chat_id = self._chat_store.current_chat_id
+        if not chat_id:
+            return
+
+        self._chat_store.append_events(chat_id, events)
+
+        for event in events:
+            role_obj = getattr(event, "role", "")
+            role = getattr(role_obj, "value", role_obj)
+            if str(role) != "tool_result":
+                continue
+            if not bool(getattr(event, "ok", False)):
+                continue
+            metadata = dict(getattr(event, "metadata", None) or {})
+            if str(metadata.get("tool_name") or "") != "run_pymol_command":
+                continue
+            payload = metadata.get("tool_result_json")
+            if isinstance(payload, dict) and payload.get("skipped"):
+                continue
+            self._chat_store.mark_scene_dirty(chat_id, reason="command_ok")
+            self._chat_store.schedule_checkpoint(chat_id)
+
+        self._chat_store.set_runtime_state(chat_id, runtime.export_session_state())
+
+    def _persist_feedback_block(self, text: str):
+        if not text.strip():
+            return
+        chat_id = getattr(self._chat_store, "current_chat_id", None)
+        if not chat_id:
+            return
+        event = UiEvent(
+            role=UiRole.SYSTEM,
+            text=text,
+            metadata={"source": "pymol_feedback"},
+        )
+        self._chat_store.append_events(chat_id, [event])
+
+    def _save_chat_checkpoint(self, session_path: str):
+        self.cmd.save(session_path, format='pse', quiet=1)
+
+    def _list_chat_rows(self, query: str, offset: int, limit: int):
+        return self._chat_store.list_chats(query=query, offset=offset, limit=limit)
+
+    def _has_unsaved_chat_work(self) -> bool:
+        if self.chat_panel.input_text().strip():
+            return True
+        return bool(self._chat_store.has_unsaved_changes())
+
+    def _on_chat_history_requested(self):
+        self._history_popup.open_at(self.chat_panel.history_anchor_widget())
+
+    def _on_history_chat_selected(self, chat_id: str):
+        if not chat_id:
+            return
+
+        if self._has_unsaved_chat_work():
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("Unsaved Work")
+            box.setText("Current chat has unsaved work. What do you want to do?")
+            save_btn = box.addButton("Save now", QtWidgets.QMessageBox.AcceptRole)
+            discard_btn = box.addButton("Discard and continue", QtWidgets.QMessageBox.DestructiveRole)
+            cancel_btn = box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked == cancel_btn:
+                return
+            if clicked == save_btn:
+                self._chat_store.flush_now()
+                self._chat_store.force_checkpoint(self._save_chat_checkpoint)
+            elif clicked != discard_btn:
+                return
+
+        payload = self._chat_store.load_chat(chat_id)
+        if not payload:
+            QtWidgets.QMessageBox.warning(self, "Load Chat", "Could not load selected chat.")
+            return
+
+        session_path = str(payload.get("session_path") or "")
+        session_loaded = False
+        if payload.get("session_exists") and session_path:
+            try:
+                self.cmd.load(session_path, format='pse', quiet=0)
+                session_loaded = True
+            except Exception as exc:  # noqa: BLE001
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Session Load Failed",
+                    "Could not load saved session for this chat:\n%s" % (exc,),
+                )
+        else:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Session Missing",
+                "Saved session file is missing for this chat. Loading transcript only.",
+            )
+
+        if not session_loaded:
+            fallback = self._chat_store.get_last_valid_session_path(exclude_chat_id=chat_id)
+            if fallback:
+                choice = QtWidgets.QMessageBox.question(
+                    self,
+                    "Use Last Valid Session",
+                    "Load the last valid saved session instead?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.Yes,
+                )
+                if choice == QtWidgets.QMessageBox.Yes:
+                    try:
+                        self.cmd.load(fallback, format='pse', quiet=0)
+                    except Exception:
+                        pass
+
+        self._chat_store.open_chat(chat_id)
+
+        manifest = payload.get("manifest") or {}
+        runtime_state = dict(manifest.get("runtime_state") or {})
+        mode = str(runtime_state.get("input_mode") or "ai")
+        events = payload.get("events") or []
+
+        runtime = self.get_ai_runtime(create=True)
+        if runtime is not None:
+            runtime.import_session_state(runtime_state, apply_model=False)
+            mode = runtime.current_input_mode
+
+        self.chat_panel.replace_transcript(events, mode)
+        self._chat_has_user_input = any(str((e or {}).get("role") or "") == "user" for e in events if isinstance(e, dict))
+        self.feedback_timer.start(0)
+
+    def _on_chat_new_requested(self):
+        if self._chat_store.count_chats() >= self._chat_store.soft_cap:
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("History Soft Cap")
+            box.setText("You have many saved chats. Choose a cleanup action or keep all.")
+            keep_btn = box.addButton("Keep all", QtWidgets.QMessageBox.AcceptRole)
+            del10_btn = box.addButton("Delete oldest 10", QtWidgets.QMessageBox.DestructiveRole)
+            del25_btn = box.addButton("Delete oldest 25", QtWidgets.QMessageBox.DestructiveRole)
+            del50_btn = box.addButton("Delete oldest 50", QtWidgets.QMessageBox.DestructiveRole)
+            manager_btn = box.addButton("Open manager", QtWidgets.QMessageBox.ActionRole)
+            cancel_btn = box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked == cancel_btn:
+                return
+            if clicked == del10_btn:
+                self._chat_store.delete_oldest(10)
+            elif clicked == del25_btn:
+                self._chat_store.delete_oldest(25)
+            elif clicked == del50_btn:
+                self._chat_store.delete_oldest(50)
+            elif clicked == manager_btn:
+                self._open_history_manager()
+                return
+            elif clicked != keep_btn:
+                return
+
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("New Chat")
+        box.setText("Start a new chat session:")
+        keep_scene_btn = box.addButton("Keep current scene, clear chat", QtWidgets.QMessageBox.AcceptRole)
+        reset_scene_btn = box.addButton("Clear chat + reinitialize scene", QtWidgets.QMessageBox.DestructiveRole)
+        cancel_btn = box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked == cancel_btn:
+            return
+
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            runtime.clear_session(emit_notice=False)
+        self.chat_panel.clear_transcript()
+        self._chat_has_user_input = False
+
+        if clicked == reset_scene_btn:
+            self.cmd.reinitialize()
+
+        self._start_new_chat_session(title_hint="")
+        self.feedback_timer.start(0)
+
+    def _open_history_manager(self):
+        dlg = ChatHistoryManagerDialog(self._list_chat_rows, self._delete_chat_by_id, self)
+        dlg.exec_()
+
+    def _delete_chat_by_id(self, chat_id: str) -> bool:
+        was_current = chat_id == getattr(self._chat_store, "current_chat_id", None)
+        deleted = self._chat_store.delete_chat(chat_id)
+        if deleted and was_current:
+            runtime = self.get_ai_runtime(create=False)
+            if runtime is not None:
+                runtime.clear_session(emit_notice=False)
+            self.chat_panel.clear_transcript()
+            self._chat_has_user_input = False
+            self._start_new_chat_session(title_hint="")
+        return deleted
 
     def doPrompt(self):
         text = self.command_get().strip()

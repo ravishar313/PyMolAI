@@ -144,6 +144,30 @@ def test_clear_session_api(monkeypatch):
     assert any(e.role == UiRole.SYSTEM and "session memory cleared" in e.text for e in events)
 
 
+def test_export_import_session_state_roundtrip(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.input_mode = "cli"
+    runtime.history = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}]
+    runtime.model = "openai/test"
+    runtime.enabled = True
+    runtime.reasoning_visible = True
+
+    state = runtime.export_session_state()
+    assert state["input_mode"] == "cli"
+    assert len(state["history"]) == 2
+    assert state["model_info"]["model"] == "openai/test"
+
+    restored = _runtime(monkeypatch)
+    restored.import_session_state(state, apply_model=False)
+    assert restored.input_mode == "cli"
+    assert restored.history == runtime.history
+    assert restored.model != ""
+
+    restored.import_session_state(state, apply_model=True)
+    assert restored.model == "openai/test"
+    assert restored.reasoning_visible is True
+
+
 def test_cancel_request_stops_worker_cleanly(monkeypatch):
     runtime = _runtime(monkeypatch)
     runtime.request_cancel()
