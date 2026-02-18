@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 from typing import Optional
 
 from pymol.Qt import QtCore, QtGui, QtWidgets
@@ -120,138 +121,120 @@ class MessageBubble(QtWidgets.QFrame):
         self.set_text(self._raw_text)
 
 
-class ToolStartChip(QtWidgets.QFrame):
-    def __init__(self, text: str, parent=None):
-        super().__init__(parent)
-        self.setObjectName("toolStartChip")
-
-        layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(10, 6, 10, 6)
-        layout.setSpacing(8)
-
-        badge = QtWidgets.QLabel("TOOL")
-        badge.setObjectName("toolStartBadge")
-        layout.addWidget(badge)
-
-        summary = QtWidgets.QLabel(str(text or ""))
-        summary.setWordWrap(True)
-        summary.setObjectName("toolStartSummary")
-        layout.addWidget(summary, 1)
-
-        self.setStyleSheet(
-            """
-            QFrame#toolStartChip {
-                background: #2b2412;
-                border: 1px solid #6c5a20;
-                border-radius: 8px;
-            }
-            QLabel#toolStartBadge {
-                color: #1a1a1a;
-                background: #e3b341;
-                border-radius: 4px;
-                padding: 2px 6px;
-                font-weight: 700;
-                font-size: 10px;
-            }
-            QLabel#toolStartSummary {
-                color: #f8d98c;
-                font-size: 12px;
-            }
-            """
-        )
-
-
 class ToolResultCard(QtWidgets.QFrame):
-    def __init__(self, text: str, ok: bool, metadata: Optional[dict] = None, parent=None):
+    def __init__(
+        self,
+        text: str,
+        ok: bool,
+        metadata: Optional[dict] = None,
+        tool_label: str = "",
+        parent=None,
+    ):
         super().__init__(parent)
-        metadata = metadata or {}
+        metadata = dict(metadata or {})
         self._expanded = False
+        self._tool_name = self._resolve_tool_name(text, metadata, tool_label)
+        args_text = self._json_block(metadata.get("tool_args"), fallback="{}")
+        result_source = metadata.get("tool_result_json")
+        if result_source is None:
+            result_source = text
+        result_text = self._json_block(result_source, fallback=str(text or "").strip())
+        details_payload = "Arguments\n%s\n\nResult\n%s" % (args_text, result_text)
 
         self.setObjectName("toolResultCard")
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(4)
 
         header = QtWidgets.QHBoxLayout()
-        header.setSpacing(8)
-        status = QtWidgets.QLabel("TOOL OK" if ok else "TOOL ERROR")
-        status.setObjectName("toolResultStatusOk" if ok else "toolResultStatusErr")
-        header.addWidget(status, 0)
+        header.setSpacing(6)
 
-        lines = str(text or "").splitlines()
-        summary_text = lines[0] if lines else ("ok" if ok else "error")
-        summary = QtWidgets.QLabel(summary_text)
+        summary = QtWidgets.QLabel("Ran tool: %s" % (self._tool_name,))
         summary.setWordWrap(True)
         summary.setObjectName("toolResultSummary")
         header.addWidget(summary, 1)
 
-        self.details_button = QtWidgets.QPushButton("Details")
+        self.details_button = QtWidgets.QToolButton()
         self.details_button.setObjectName("toolResultDetailsButton")
+        self.details_button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.details_button.setArrowType(Qt.RightArrow)
         self.details_button.setCheckable(True)
+        self.details_button.setCursor(Qt.PointingHandCursor)
+        self.details_button.setToolTip("Show details")
         self.details_button.toggled.connect(self._toggle_details)
         header.addWidget(self.details_button, 0)
 
         layout.addLayout(header)
 
-        vv = metadata.get("visual_validation")
-        if vv:
-            note = QtWidgets.QLabel(str(vv))
-            note.setWordWrap(True)
-            note.setObjectName("toolResultMeta")
-            layout.addWidget(note)
-
         self.details = AutoHeightTextBrowser()
         self.details.setObjectName("toolResultDetails")
-        self.details.setHtml(_plain_to_html(str(text or ""), monospace=True))
+        self.details.setHtml(_plain_to_html(details_payload, monospace=True))
         self.details.hide()
         layout.addWidget(self.details)
 
         self.setStyleSheet(
             """
             QFrame#toolResultCard {
-                background: #121a24;
-                border: 1px solid #2e445f;
+                background: #121b27;
+                border: 1px solid #2a3c52;
                 border-radius: 8px;
             }
-            QLabel#toolResultStatusOk {
-                color: #0f2918;
-                background: #3fb950;
-                border-radius: 4px;
-                padding: 2px 6px;
-                font-size: 10px;
-                font-weight: 700;
-            }
-            QLabel#toolResultStatusErr {
-                color: #2e0d11;
-                background: #f85149;
-                border-radius: 4px;
-                padding: 2px 6px;
-                font-size: 10px;
-                font-weight: 700;
-            }
             QLabel#toolResultSummary {
-                color: #d5deea;
+                color: #d9e4f2;
                 font-size: 12px;
+                font-weight: 500;
             }
-            QLabel#toolResultMeta {
-                color: #8fa4bf;
-                font-size: 11px;
-                font-style: italic;
-            }
-            QPushButton#toolResultDetailsButton {
-                padding: 2px 8px;
+            QToolButton#toolResultDetailsButton {
+                color: #a8c7ea;
+                padding: 0px;
             }
             QTextBrowser#toolResultDetails {
-                color: #b9d1ec;
+                color: #c2d8ef;
                 background: #0d131d;
+                border: 1px solid #22344b;
+                border-radius: 4px;
+                padding: 6px;
             }
             """
         )
 
+    @staticmethod
+    def _resolve_tool_name(text: str, metadata: dict, tool_label: str) -> str:
+        command = str(metadata.get("tool_command") or "").strip()
+        if command:
+            return command
+        tool_name = str(metadata.get("tool_name") or "").strip()
+        if tool_name:
+            return tool_name
+        if tool_label:
+            return str(tool_label).strip()
+        raw = str(text or "").strip()
+        if raw.lower().startswith("ran tool:"):
+            raw = raw[9:].strip()
+        return raw or "tool"
+
+    @staticmethod
+    def _json_block(value, *, fallback: str = "") -> str:
+        if value is None:
+            return fallback or "null"
+        parsed = value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return fallback or ""
+            try:
+                parsed = json.loads(stripped)
+            except Exception:
+                return stripped
+        try:
+            return json.dumps(parsed, ensure_ascii=False, indent=2)
+        except Exception:
+            return fallback or str(value)
+
     def _toggle_details(self, visible: bool):
         self._expanded = bool(visible)
         self.details.setVisible(self._expanded)
-        self.details_button.setText("Hide" if self._expanded else "Details")
+        self.details_button.setArrowType(Qt.DownArrow if self._expanded else Qt.RightArrow)
 
 
 class ChatInputEdit(QtWidgets.QPlainTextEdit):
@@ -287,6 +270,8 @@ class AssistantChatPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._active_ai_bubble = None
+        self._pending_tool_start = ""
+        self._last_ai_text = ""
         self._mode = "ai"
 
         root = QtWidgets.QVBoxLayout(self)
@@ -296,10 +281,6 @@ class AssistantChatPanel(QtWidgets.QWidget):
         header = QtWidgets.QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
-
-        title = QtWidgets.QLabel("Assistant Chat")
-        title.setObjectName("chatPanelTitle")
-        header.addWidget(title)
 
         header.addStretch(1)
 
@@ -350,11 +331,6 @@ class AssistantChatPanel(QtWidgets.QWidget):
             """
             AssistantChatPanel {
                 background: #1f1f1f;
-            }
-            QLabel#chatPanelTitle {
-                color: #d7dde5;
-                font-size: 13px;
-                font-weight: 700;
             }
             QLabel#chatModeBadge {
                 color: #04162f;
@@ -422,6 +398,8 @@ class AssistantChatPanel(QtWidgets.QWidget):
 
     def clear_transcript(self):
         self._active_ai_bubble = None
+        self._pending_tool_start = ""
+        self._last_ai_text = ""
         while self.feed_layout.count() > 1:
             item = self.feed_layout.takeAt(0)
             widget = item.widget()
@@ -450,13 +428,25 @@ class AssistantChatPanel(QtWidgets.QWidget):
             self._active_ai_bubble = None
 
             if role == "user":
+                self._last_ai_text = ""
                 bubble = MessageBubble("You", kind="user", markdown=False)
                 bubble.set_text(text)
                 self._append_widget(bubble)
             elif role == "tool_start":
-                self._append_widget(ToolStartChip(text))
+                self._pending_tool_start = text
             elif role == "tool_result":
-                self._append_widget(ToolResultCard(text, bool(getattr(event, "ok", False)), getattr(event, "metadata", None)))
+                metadata = dict(getattr(event, "metadata", None) or {})
+                if self._pending_tool_start:
+                    metadata.setdefault("tool_command", self._pending_tool_start)
+                self._append_widget(
+                    ToolResultCard(
+                        text,
+                        bool(getattr(event, "ok", False)),
+                        metadata,
+                        tool_label=self._pending_tool_start,
+                    )
+                )
+                self._pending_tool_start = ""
             elif role == "reasoning":
                 bubble = MessageBubble("Reasoning", kind="reasoning", markdown=False)
                 bubble.set_text(text)
@@ -466,15 +456,27 @@ class AssistantChatPanel(QtWidgets.QWidget):
                 bubble.set_text(text)
                 self._append_widget(bubble)
             else:
+                if text.strip().lower() == "planning...":
+                    continue
                 bubble = MessageBubble("System", kind="system", markdown=False)
                 bubble.set_text(text)
                 self._append_widget(bubble)
 
     def _append_ai_text(self, text: str):
+        clean = str(text or "").strip()
+        if not clean:
+            return
+        if not self._active_ai_bubble and clean == self._last_ai_text:
+            return
+        if self._active_ai_bubble and self._active_ai_bubble._raw_text:
+            last_line = self._active_ai_bubble._raw_text.splitlines()[-1].strip()
+            if last_line == clean:
+                return
         if not self._active_ai_bubble:
             self._active_ai_bubble = MessageBubble("Assistant", kind="assistant", markdown=True)
             self._append_widget(self._active_ai_bubble)
-        self._active_ai_bubble.append_text(text)
+        self._active_ai_bubble.append_text(clean)
+        self._last_ai_text = clean
         self._scroll_to_bottom()
 
     def _append_widget(self, widget: QtWidgets.QWidget):

@@ -201,6 +201,16 @@ def test_agent_tool_call_then_final_answer(monkeypatch):
 
     assert runtime.cmd._parser.commands == ["zoom"]
     assert any(m.get("role") == "tool" for m in runtime.history)
+    events = _events(runtime)
+    tool_events = [e for e in events if e.role == UiRole.TOOL_RESULT]
+    assert tool_events
+    meta = tool_events[0].metadata
+    assert "tool_call_id" in meta
+    assert "tool_name" in meta
+    assert "tool_args" in meta
+    assert "tool_command" in meta
+    assert "tool_result_json" in meta
+    assert not any(e.role == UiRole.SYSTEM and e.text == "planning..." for e in events)
 
 
 def test_tool_failure_is_returned_to_loop(monkeypatch):
@@ -296,6 +306,7 @@ def test_step_limit_has_explicit_error(monkeypatch):
 
     events = _events(runtime)
     assert any(e.role == UiRole.ERROR and "step limit" in e.text for e in events)
+    assert not any(e.role == UiRole.SYSTEM and e.text == "planning..." for e in events)
 
 
 def test_validation_required_inserts_snapshot_turn(monkeypatch):
@@ -329,12 +340,115 @@ def test_validation_required_inserts_snapshot_turn(monkeypatch):
 
     runtime._agent_worker("zoom then answer")
     events = _events(runtime)
-    assert any(e.role == UiRole.TOOL_START and "capture_viewer_snapshot" in e.text for e in events)
+    snapshot_events = [
+        e
+        for e in events
+        if e.role == UiRole.TOOL_RESULT and e.metadata.get("tool_name") == "capture_viewer_snapshot"
+    ]
+    assert snapshot_events
     assert any(
         e.role == UiRole.TOOL_RESULT
         and e.metadata.get("visual_validation") == "validated: screenshot+state"
         for e in events
     )
+    meta = snapshot_events[0].metadata
+    assert "tool_call_id" in meta
+    assert "tool_args" in meta
+    assert "tool_result_json" in meta
+
+
+def test_duplicate_command_in_turn_is_skipped(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.screenshot_validate_required = False
+    runtime.doom_loop_threshold = 5
+    runtime._client = FakeClient([
+        {
+            "assistant_text": "I will zoom now and then confirm.",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_1",
+                    name="run_pymol_command",
+                    arguments={"command": "zoom"},
+                    arguments_json='{"command":"zoom"}',
+                )
+            ],
+        },
+        {
+            "assistant_text": "I will zoom now and then confirm.",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_2",
+                    name="run_pymol_command",
+                    arguments={"command": "zoom"},
+                    arguments_json='{"command":"zoom"}',
+                )
+            ],
+        },
+        {"assistant_text": "Done.", "tool_calls": []},
+    ])
+
+    runtime._agent_worker("zoom")
+    assert runtime.cmd._parser.commands == ["zoom"]
+
+    events = _events(runtime)
+    tool_events = [e for e in events if e.role == UiRole.TOOL_RESULT]
+    assert len(tool_events) >= 2
+    assert any(
+        isinstance(e.metadata.get("tool_result_json"), dict)
+        and e.metadata.get("tool_result_json", {}).get("skipped") is True
+        for e in tool_events
+    )
+
+
+def test_stall_loop_aborts_after_hidden_nudge(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.screenshot_validate_required = False
+    runtime.doom_loop_threshold = 2
+    runtime._client = FakeClient([
+        {
+            "assistant_text": "I will set this up step by step and apply electrostatics for you.",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_1",
+                    name="run_pymol_command",
+                    arguments={"command": "select fmn, resn FMN"},
+                    arguments_json='{"command":"select fmn, resn FMN"}',
+                )
+            ],
+        },
+        {
+            "assistant_text": "I will set this up step by step and apply electrostatics for you.",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_2",
+                    name="run_pymol_command",
+                    arguments={"command": "select binding_site, fmn expand 5"},
+                    arguments_json='{"command":"select binding_site, fmn expand 5"}',
+                )
+            ],
+        },
+        {
+            "assistant_text": "I will set this up step by step and apply electrostatics for you.",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_3",
+                    name="run_pymol_command",
+                    arguments={"command": "show surface, binding_site"},
+                    arguments_json='{"command":"show surface, binding_site"}',
+                )
+            ],
+        },
+    ])
+
+    runtime._agent_worker("show FMN electrostatics")
+
+    assert runtime.cmd._parser.commands == ["select fmn, resn FMN", "select binding_site, fmn expand 5"]
+    assert any(
+        m.get("role") == "system" and str(m.get("content", "")).startswith("DOOM LOOP DETECTED:")
+        for m in runtime.history
+    )
+    events = _events(runtime)
+    assert any(e.role == UiRole.ERROR and "I'm stuck" in e.text for e in events)
 
 
 def test_snapshot_failure_fallback_warning(monkeypatch):

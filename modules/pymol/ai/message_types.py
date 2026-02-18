@@ -20,6 +20,8 @@ class UiEvent:
     role: UiRole
     text: str
     ok: Optional[bool] = None
+    # Tool events may populate:
+    # tool_call_id, tool_name, tool_args, tool_command, tool_result_json.
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 

@@ -28,6 +28,9 @@ Rules:
 - If tool results already answer the user, return a concise final answer and DO NOT call tools.
 - Do not use shell commands.
 - Prefer continuing current session state; avoid redundant fetch/load.
+- Do not repeat the same setup sentence or intent text step after step.
+- If a strategy fails repeatedly, switch approach or ask the user for clarification.
+- Do not re-run the same successful command in the same request unless you clearly explain why.
 - Keep answers concise and practical.
 """
 
@@ -211,7 +214,6 @@ class AiRuntime:
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="/cli | /cli off | /cli <pymol command>"))
             return
 
-        self.emit_ui_event(UiEvent(role=UiRole.TOOL_START, text="[CLI one-off] %s" % (rest,)))
         self._execute_cli_command(rest)
 
     def _handle_ai_control(self, command: str) -> None:
@@ -276,7 +278,6 @@ class AiRuntime:
             self._busy = True
             self._cancel_event.clear()
 
-        self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="planning..."))
         thread = threading.Thread(
             target=self._agent_worker,
             kwargs={"prompt": prompt},
@@ -424,15 +425,26 @@ class AiRuntime:
         self._append_history({"role": "user", "content": "CLI command: %s" % (fixed,)})
         result = self._run_in_gui(lambda c=fixed: run_pymol_command(self.cmd, c))
         self._remember_tool_result(result.command, result.ok, result.error)
-
-        if result.ok:
-            lines = "\n".join(result.feedback_lines) if result.feedback_lines else "ok"
-            self.emit_ui_event(UiEvent(role=UiRole.TOOL_RESULT, text=lines, ok=True))
-        else:
-            text = result.error
-            if result.feedback_lines:
-                text = text + "\n" + "\n".join(result.feedback_lines)
-            self.emit_ui_event(UiEvent(role=UiRole.TOOL_RESULT, text=text, ok=False))
+        payload = {
+            "ok": result.ok,
+            "command": result.command,
+            "error": result.error or None,
+            "feedback_lines": result.feedback_lines,
+        }
+        self.emit_ui_event(
+            UiEvent(
+                role=UiRole.TOOL_RESULT,
+                text="Ran tool: %s" % (fixed,),
+                ok=result.ok,
+                metadata={
+                    "tool_call_id": "cli:%s" % (self._normalized_command_key(fixed) or "command",),
+                    "tool_name": "run_pymol_command",
+                    "tool_args": {"command": fixed},
+                    "tool_command": fixed,
+                    "tool_result_json": self._tool_result_metadata_payload(payload),
+                },
+            )
+        )
 
     def _assistant_message_with_tools(self, assistant_text: str, tool_calls: List[ToolCall]) -> Dict[str, object]:
         tc_payload = []
@@ -448,6 +460,19 @@ class AiRuntime:
 
     def _tool_result_content(self, payload: Dict[str, object]) -> str:
         return json.dumps(payload, ensure_ascii=False)
+
+    def _tool_result_metadata_payload(self, payload: Dict[str, object]) -> object:
+        serialized = self._tool_result_content(payload)
+        if len(serialized) <= self.tool_result_max_chars:
+            return payload
+        return {
+            "truncated": True,
+            "preview": serialized[: self.tool_result_max_chars] + "... [truncated]",
+        }
+
+    @staticmethod
+    def _normalized_command_key(command: str) -> str:
+        return re.sub(r"\s+", " ", str(command or "").strip().lower())
 
     def _execute_snapshot_tool(self) -> Tuple[Dict[str, object], Optional[str], Dict[str, object]]:
         capture = self._run_in_gui(
@@ -477,6 +502,8 @@ class AiRuntime:
         snapshot_image_data_url: Optional[str] = None
         snapshot_state_summary: Optional[Dict[str, object]] = None
         cancelled = False
+        successful_commands_this_turn = set()
+        loop_nudged_at_step = 0
 
         def is_cancelled() -> bool:
             return self._cancel_event.is_set()
@@ -488,6 +515,31 @@ class AiRuntime:
             if not cancelled:
                 self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="request cancelled"))
                 cancelled = True
+            return True
+
+        def maybe_handle_stall(loop: Dict[str, object], step_index: int) -> bool:
+            nonlocal loop_nudged_at_step
+            if not loop:
+                return False
+
+            if loop_nudged_at_step == 0:
+                loop_type = str(loop.get("loop_type") or "stall")
+                family = str(loop.get("command_family") or "").strip()
+                hidden = (
+                    "DOOM LOOP DETECTED: %s%s. Stop repeating the same setup phrasing. "
+                    "Switch approach or ask the user to clarify target selection."
+                    % (loop_type, (" (%s)" % family) if family else "")
+                )
+                self._append_history({"role": "system", "content": hidden})
+                loop_nudged_at_step = step_index
+                return False
+
+            if step_index <= loop_nudged_at_step:
+                return False
+
+            stuck = "I'm stuck; please narrow or clarify the target selection."
+            self.emit_ui_event(UiEvent(role=UiRole.ERROR, text=stuck))
+            self._append_history({"role": "assistant", "content": stuck})
             return True
 
         try:
@@ -529,6 +581,9 @@ class AiRuntime:
 
                 assistant_text = str(turn.get("assistant_text") or "").strip()
                 tool_calls = list(turn.get("tool_calls") or [])
+                intent_loop = detector.add_assistant_intent(assistant_text)
+                if maybe_handle_stall(intent_loop, step):
+                    return
 
                 if not tool_calls:
                     if self.screenshot_validate_required and pending_validation_required and not validation_done_this_turn:
@@ -562,20 +617,37 @@ class AiRuntime:
                         return
 
                     if tc.name == "capture_viewer_snapshot":
-                        self.emit_ui_event(UiEvent(role=UiRole.TOOL_START, text="capture_viewer_snapshot"))
-
                         payload, image_data_url, state_summary = self._execute_snapshot_tool()
                         snapshot_image_data_url = image_data_url
                         snapshot_state_summary = state_summary
 
+                        meta = {
+                            "tool_call_id": tc.tool_call_id,
+                            "tool_name": tc.name,
+                            "tool_args": tc.arguments,
+                            "tool_command": None,
+                            "tool_result_json": self._tool_result_metadata_payload(payload),
+                        }
                         if payload["ok"]:
-                            txt = "viewer snapshot captured (%s bytes)" % payload.get("meta", {}).get("bytes", "?")
-                            meta = {"visual_validation": "validated: screenshot+state"}
-                            self.emit_ui_event(UiEvent(role=UiRole.TOOL_RESULT, text=txt, ok=True, metadata=meta))
+                            meta["visual_validation"] = "validated: screenshot+state"
+                            self.emit_ui_event(
+                                UiEvent(
+                                    role=UiRole.TOOL_RESULT,
+                                    text="Ran tool: capture_viewer_snapshot",
+                                    ok=True,
+                                    metadata=meta,
+                                )
+                            )
                         else:
-                            txt = "viewer snapshot failed: %s" % (payload.get("error") or "unknown error")
-                            meta = {"visual_validation": "validated: state-only (screenshot failed)"}
-                            self.emit_ui_event(UiEvent(role=UiRole.TOOL_RESULT, text=txt, ok=False, metadata=meta))
+                            meta["visual_validation"] = "validated: state-only (screenshot failed)"
+                            self.emit_ui_event(
+                                UiEvent(
+                                    role=UiRole.TOOL_RESULT,
+                                    text="Ran tool: capture_viewer_snapshot",
+                                    ok=False,
+                                    metadata=meta,
+                                )
+                            )
 
                         content = self._tool_result_content(payload)
                         tool_msg = {
@@ -597,7 +669,20 @@ class AiRuntime:
                             "feedback_lines": [],
                         }
                         err_content = self._tool_result_content(payload)
-                        self.emit_ui_event(UiEvent(role=UiRole.TOOL_RESULT, text=err_content, ok=False))
+                        self.emit_ui_event(
+                            UiEvent(
+                                role=UiRole.TOOL_RESULT,
+                                text="Ran tool: %s" % (tc.name,),
+                                ok=False,
+                                metadata={
+                                    "tool_call_id": tc.tool_call_id,
+                                    "tool_name": tc.name,
+                                    "tool_args": tc.arguments,
+                                    "tool_command": None,
+                                    "tool_result_json": self._tool_result_metadata_payload(payload),
+                                },
+                            )
+                        )
                         tool_msg = {
                             "role": "tool",
                             "tool_call_id": tc.tool_call_id,
@@ -612,25 +697,44 @@ class AiRuntime:
                     if note:
                         self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text=note))
 
-                    self.emit_ui_event(UiEvent(role=UiRole.TOOL_START, text=command))
-                    exec_result = self._run_in_gui(lambda c=command: run_pymol_command(self.cmd, c))
-                    self._remember_tool_result(exec_result.command, exec_result.ok, exec_result.error)
-                    if check_cancel():
-                        return
+                    command_key = self._normalized_command_key(command)
+                    if command_key in successful_commands_this_turn:
+                        payload = {
+                            "ok": True,
+                            "command": command,
+                            "error": None,
+                            "feedback_lines": [],
+                            "skipped": True,
+                            "skip_reason": "duplicate command skipped in current turn",
+                        }
+                    else:
+                        exec_result = self._run_in_gui(lambda c=command: run_pymol_command(self.cmd, c))
+                        self._remember_tool_result(exec_result.command, exec_result.ok, exec_result.error)
+                        if check_cancel():
+                            return
+                        payload = {
+                            "ok": exec_result.ok,
+                            "command": exec_result.command,
+                            "error": exec_result.error or None,
+                            "feedback_lines": exec_result.feedback_lines,
+                        }
+                        if exec_result.ok:
+                            successful_commands_this_turn.add(command_key)
 
-                    payload = {
-                        "ok": exec_result.ok,
-                        "command": exec_result.command,
-                        "error": exec_result.error or None,
-                        "feedback_lines": exec_result.feedback_lines,
-                    }
                     result_text = self._tool_result_content(payload)
-                    visible_text = result_text
-                    if len(visible_text) > self.tool_result_max_chars:
-                        visible_text = visible_text[: self.tool_result_max_chars] + "... [truncated]"
-
                     self.emit_ui_event(
-                        UiEvent(role=UiRole.TOOL_RESULT, text=visible_text, ok=exec_result.ok)
+                        UiEvent(
+                            role=UiRole.TOOL_RESULT,
+                            text="Ran tool: %s" % (command,),
+                            ok=bool(payload.get("ok")),
+                            metadata={
+                                "tool_call_id": tc.tool_call_id,
+                                "tool_name": tc.name,
+                                "tool_args": tc.arguments,
+                                "tool_command": command,
+                                "tool_result_json": self._tool_result_metadata_payload(payload),
+                            },
+                        )
                     )
 
                     msg_content = result_text
@@ -645,7 +749,7 @@ class AiRuntime:
                     }
                     self._append_history(tool_msg)
 
-                    if self._is_state_changing_command(exec_result.command):
+                    if self._is_state_changing_command(str(payload.get("command") or command)):
                         pending_validation_required = True
 
                     loop = detector.add_call(
@@ -653,14 +757,8 @@ class AiRuntime:
                         tc.arguments,
                         validation_required=pending_validation_required,
                     )
-                    if loop:
-                        warning = (
-                            "DOOM LOOP DETECTED: tool '%s' repeated %d times with identical arguments. "
-                            "Try a different approach and do not repeat the same tool call."
-                            % (loop["tool_name"], loop["call_count"])
-                        )
-                        self._append_history({"role": "system", "content": warning})
-                        self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text=warning))
+                    if maybe_handle_stall(loop, step):
+                        return
 
                 # If tools executed and validation required but not done, nudge immediately.
                 if self.screenshot_validate_required and pending_validation_required and not validation_done_this_turn:

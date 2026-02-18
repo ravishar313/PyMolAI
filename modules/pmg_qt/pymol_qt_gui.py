@@ -122,6 +122,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.chat_panel.sendCommand.connect(self._on_chat_command_submitted)
         self.chat_panel.clearRequested.connect(self._on_chat_clear_requested)
         self.chat_panel.stopRequested.connect(self._on_chat_stop_requested)
+        self._chat_has_user_input = False
         self.lineedit = self.chat_panel.input_edit
 
         self.ext_window = dockWidget = QtWidgets.QDockWidget(self)
@@ -792,7 +793,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         feedback = self.cmd._get_feedback()
         if feedback:
             filtered_feedback = self._filter_internal_feedback_lines(feedback)
-            if filtered_feedback:
+            if filtered_feedback and self._chat_has_user_input:
                 self.chat_panel.append_feedback_block('\n'.join(str(x) for x in filtered_feedback))
 
         for setting in self.cmd.get_setting_updates() or ():
@@ -823,6 +824,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         return out
 
     def _on_chat_command_submitted(self, text):
+        self._chat_has_user_input = True
         self.doTypedCommand(text)
         self.pymolwidget._pymolProcess()
         self.feedback_timer.start(0)
