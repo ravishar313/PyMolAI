@@ -133,13 +133,12 @@ class ToolResultCard(QtWidgets.QFrame):
         super().__init__(parent)
         metadata = dict(metadata or {})
         self._expanded = False
+        self._details_rendered = False
         self._tool_name = self._resolve_tool_name(text, metadata, tool_label)
-        args_text = self._json_block(metadata.get("tool_args"), fallback="{}")
-        result_source = metadata.get("tool_result_json")
-        if result_source is None:
-            result_source = text
-        result_text = self._json_block(result_source, fallback=str(text or "").strip())
-        details_payload = "Arguments\n%s\n\nResult\n%s" % (args_text, result_text)
+        self._tool_args = metadata.get("tool_args")
+        self._tool_result_source = metadata.get("tool_result_json")
+        if self._tool_result_source is None:
+            self._tool_result_source = text
 
         self.setObjectName("toolResultCard")
         layout = QtWidgets.QVBoxLayout(self)
@@ -149,7 +148,7 @@ class ToolResultCard(QtWidgets.QFrame):
         header = QtWidgets.QHBoxLayout()
         header.setSpacing(6)
 
-        summary = QtWidgets.QLabel("Ran tool: %s" % (self._tool_name,))
+        summary = QtWidgets.QLabel("Executed: %s" % (self._tool_name,))
         summary.setWordWrap(True)
         summary.setObjectName("toolResultSummary")
         header.addWidget(summary, 1)
@@ -168,24 +167,23 @@ class ToolResultCard(QtWidgets.QFrame):
 
         self.details = AutoHeightTextBrowser()
         self.details.setObjectName("toolResultDetails")
-        self.details.setHtml(_plain_to_html(details_payload, monospace=True))
         self.details.hide()
         layout.addWidget(self.details)
 
         self.setStyleSheet(
             """
             QFrame#toolResultCard {
-                background: #121b27;
-                border: 1px solid #2a3c52;
+                background: #0e2428;
+                border: 1px solid #2f8f98;
                 border-radius: 8px;
             }
             QLabel#toolResultSummary {
-                color: #d9e4f2;
+                color: #d4f5f7;
                 font-size: 12px;
-                font-weight: 500;
+                font-weight: 600;
             }
             QToolButton#toolResultDetailsButton {
-                color: #a8c7ea;
+                color: #9ad5db;
                 padding: 0px;
             }
             QTextBrowser#toolResultDetails {
@@ -209,8 +207,11 @@ class ToolResultCard(QtWidgets.QFrame):
         if tool_label:
             return str(tool_label).strip()
         raw = str(text or "").strip()
-        if raw.lower().startswith("ran tool:"):
-            raw = raw[9:].strip()
+        low = raw.lower()
+        for prefix in ("ran tool:", "executed:"):
+            if low.startswith(prefix):
+                raw = raw[len(prefix) :].strip()
+                break
         return raw or "tool"
 
     @staticmethod
@@ -231,9 +232,17 @@ class ToolResultCard(QtWidgets.QFrame):
         except Exception:
             return fallback or str(value)
 
+    def _build_details_payload(self) -> str:
+        args_text = self._json_block(self._tool_args, fallback="{}")
+        result_text = self._json_block(self._tool_result_source, fallback=str(self._tool_result_source or ""))
+        return "Arguments\n%s\n\nResult\n%s" % (args_text, result_text)
+
     def _toggle_details(self, visible: bool):
         self._expanded = bool(visible)
         self.details.setVisible(self._expanded)
+        if self._expanded and not self._details_rendered:
+            self.details.setHtml(_plain_to_html(self._build_details_payload(), monospace=True))
+            self._details_rendered = True
         self.details_button.setArrowType(Qt.DownArrow if self._expanded else Qt.RightArrow)
 
 
@@ -266,13 +275,22 @@ class AssistantChatPanel(QtWidgets.QWidget):
     sendCommand = QtCore.Signal(str)
     clearRequested = QtCore.Signal()
     stopRequested = QtCore.Signal()
+    MAX_VISIBLE_CARDS = 200
+    AI_FLUSH_INTERVAL_MS = 60
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._active_ai_bubble = None
         self._pending_tool_start = ""
         self._last_ai_text = ""
+        self._pending_ai_lines = []
         self._mode = "ai"
+        self._max_visible_cards = self.MAX_VISIBLE_CARDS
+
+        self._ai_flush_timer = QtCore.QTimer(self)
+        self._ai_flush_timer.setSingleShot(True)
+        self._ai_flush_timer.setInterval(self.AI_FLUSH_INTERVAL_MS)
+        self._ai_flush_timer.timeout.connect(self._flush_pending_ai_text)
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -375,9 +393,11 @@ class AssistantChatPanel(QtWidgets.QWidget):
             self.input_edit.setPlaceholderText("Ask PyMolAI... (Enter to send, Shift+Enter newline)")
 
     def clear_transcript(self):
+        self._ai_flush_timer.stop()
         self._active_ai_bubble = None
         self._pending_tool_start = ""
         self._last_ai_text = ""
+        self._pending_ai_lines = []
         while self.feed_layout.count() > 1:
             item = self.feed_layout.takeAt(0)
             widget = item.widget()
@@ -403,6 +423,7 @@ class AssistantChatPanel(QtWidgets.QWidget):
                 self._append_ai_text(text)
                 continue
 
+            self._flush_pending_ai_text()
             self._active_ai_bubble = None
 
             if role == "user":
@@ -446,20 +467,49 @@ class AssistantChatPanel(QtWidgets.QWidget):
             return
         if not self._active_ai_bubble and clean == self._last_ai_text:
             return
+        if self._pending_ai_lines and self._pending_ai_lines[-1] == clean:
+            return
         if self._active_ai_bubble and self._active_ai_bubble._raw_text:
-            last_line = self._active_ai_bubble._raw_text.splitlines()[-1].strip()
+            lines = self._active_ai_bubble._raw_text.splitlines()
+            last_line = lines[-1].strip() if lines else ""
             if last_line == clean:
                 return
         if not self._active_ai_bubble:
             self._active_ai_bubble = MessageBubble("PyMolAI", kind="assistant", markdown=True)
             self._append_widget(self._active_ai_bubble)
-        self._active_ai_bubble.append_text(clean)
-        self._last_ai_text = clean
+        self._pending_ai_lines.append(clean)
+        if not self._ai_flush_timer.isActive():
+            self._ai_flush_timer.start()
+
+    def _flush_pending_ai_text(self):
+        if not self._pending_ai_lines:
+            return
+        if not self._active_ai_bubble:
+            self._pending_ai_lines = []
+            return
+        chunk = "\n".join(self._pending_ai_lines)
+        self._pending_ai_lines = []
+        self._active_ai_bubble.append_text(chunk)
+        lines = chunk.splitlines()
+        if lines:
+            self._last_ai_text = lines[-1].strip()
         self._scroll_to_bottom()
 
     def _append_widget(self, widget: QtWidgets.QWidget):
         self.feed_layout.insertWidget(self.feed_layout.count() - 1, widget)
+        self._trim_transcript_widgets()
         self._scroll_to_bottom()
+
+    def _trim_transcript_widgets(self):
+        while (self.feed_layout.count() - 1) > self._max_visible_cards:
+            item = self.feed_layout.takeAt(0)
+            if not item:
+                break
+            widget = item.widget()
+            if widget is self._active_ai_bubble:
+                self._active_ai_bubble = None
+            if widget is not None:
+                widget.deleteLater()
 
     def _scroll_to_bottom(self):
         bar = self.scroll.verticalScrollBar()

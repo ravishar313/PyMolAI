@@ -780,12 +780,16 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
 
     def update_feedback(self):
         self.update_progress()
+        next_feedback_ms = 500
 
         runtime = self.get_ai_runtime(create=False)
         if runtime is not None:
-            events = runtime.drain_ui_events()
+            batch_size = max(1, int(getattr(runtime, "ui_event_batch", 40)))
+            events = runtime.drain_ui_events(limit=batch_size)
             if events:
                 self.chat_panel.append_ai_events(events)
+            if runtime.has_pending_ui_events():
+                next_feedback_ms = 0
             self.chat_panel.set_mode(runtime.current_input_mode)
         else:
             self.chat_panel.set_mode("ai")
@@ -802,7 +806,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
                 for callback in self.setting_callbacks[setting]:
                     callback(current_value)
 
-        self.feedback_timer.start(500)
+        self.feedback_timer.start(next_feedback_ms)
 
     @staticmethod
     def _filter_internal_feedback_lines(lines):

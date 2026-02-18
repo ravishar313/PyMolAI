@@ -4,6 +4,7 @@ import json
 import os
 import re
 import threading
+import time
 from typing import Dict, List, Optional, Tuple
 
 from .doom_loop_detector import DoomLoopDetector
@@ -60,6 +61,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
 class AiRuntime:
     def __init__(self, cmd):
         self.cmd = cmd
@@ -73,6 +81,9 @@ class AiRuntime:
         self.max_auto_repairs = _env_int("PYMOL_AI_MAX_REPAIRS", 4)
         self.tool_result_max_chars = _env_int("PYMOL_AI_TOOL_RESULT_MAX_CHARS", 4096)
         self.doom_loop_threshold = _env_int("PYMOL_AI_DOOM_LOOP_THRESHOLD", 3)
+        self.long_tool_warn_sec = _env_float("PYMOL_AI_LONG_TOOL_WARN_SEC", 8.0)
+        self.ui_event_batch = max(1, _env_int("PYMOL_AI_UI_EVENT_BATCH", 40))
+        self.ui_max_events = max(0, _env_int("PYMOL_AI_UI_MAX_EVENTS", 2000))
 
         self.screenshot_width = _env_int("PYMOL_AI_SCREENSHOT_WIDTH", 1024)
         self.screenshot_height = _env_int("PYMOL_AI_SCREENSHOT_HEIGHT", 0)
@@ -86,6 +97,7 @@ class AiRuntime:
         self._ui_events: List[UiEvent] = []
         self._ui_mode = "text"
         self._cancel_event = threading.Event()
+        self._ui_compaction_notice_sent = False
 
         self._stream_line_buffer = ""
         self._stream_had_output = False
@@ -131,6 +143,7 @@ class AiRuntime:
 
         with self._event_lock:
             self._ui_events.append(event)
+            self._compact_ui_events_locked()
 
         if self._ui_mode != "qt":
             prefix = {
@@ -149,10 +162,49 @@ class AiRuntime:
         msg = str(text or "")
         return any(msg.startswith(prefix) for prefix in _HIDDEN_SYSTEM_PREFIXES)
 
-    def drain_ui_events(self) -> List[UiEvent]:
+    def _compact_ui_events_locked(self) -> None:
+        if self.ui_max_events <= 0:
+            return
+        if len(self._ui_events) <= self.ui_max_events:
+            return
+
+        def drop_index():
+            for i, evt in enumerate(self._ui_events):
+                if evt.role in (UiRole.REASONING, UiRole.SYSTEM):
+                    if "compacted to keep UI responsive" in str(evt.text or ""):
+                        continue
+                    return i
+            return 0
+
+        while len(self._ui_events) > self.ui_max_events:
+            self._ui_events.pop(drop_index())
+
+        if not self._ui_compaction_notice_sent:
+            if len(self._ui_events) >= self.ui_max_events:
+                self._ui_events.pop(drop_index())
+            self._ui_events.append(
+                UiEvent(
+                    role=UiRole.SYSTEM,
+                    text="chat output compacted to keep UI responsive",
+                )
+            )
+            self._ui_compaction_notice_sent = True
+
+    def has_pending_ui_events(self) -> bool:
         with self._event_lock:
-            out = list(self._ui_events)
-            self._ui_events.clear()
+            return bool(self._ui_events)
+
+    def drain_ui_events(self, limit: Optional[int] = None) -> List[UiEvent]:
+        with self._event_lock:
+            if limit is None:
+                out = list(self._ui_events)
+                self._ui_events.clear()
+            else:
+                n = max(0, int(limit))
+                out = list(self._ui_events[:n])
+                del self._ui_events[:n]
+            if not self._ui_events:
+                self._ui_compaction_notice_sent = False
         return out
 
     def handle_typed_input(self, text: str) -> bool:
@@ -438,7 +490,7 @@ class AiRuntime:
         self.emit_ui_event(
             UiEvent(
                 role=UiRole.TOOL_RESULT,
-                text="Ran tool: %s" % (fixed,),
+                text="Executed: %s" % (fixed,),
                 ok=result.ok,
                 metadata={
                     "tool_call_id": "cli:%s" % (self._normalized_command_key(fixed) or "command",),
@@ -553,6 +605,7 @@ class AiRuntime:
 
             pending_validation_required = False
             validation_done_this_turn = False
+            slow_tool_notice_emitted = False
 
             for step in range(1, self.max_agent_steps + 1):
                 if check_cancel():
@@ -621,7 +674,9 @@ class AiRuntime:
                         return
 
                     if tc.name == "capture_viewer_snapshot":
+                        started = time.monotonic()
                         payload, image_data_url, state_summary = self._execute_snapshot_tool()
+                        elapsed = time.monotonic() - started
                         snapshot_image_data_url = image_data_url
                         snapshot_state_summary = state_summary
 
@@ -637,7 +692,7 @@ class AiRuntime:
                             self.emit_ui_event(
                                 UiEvent(
                                     role=UiRole.TOOL_RESULT,
-                                    text="Ran tool: capture_viewer_snapshot",
+                                    text="Executed: capture_viewer_snapshot",
                                     ok=True,
                                     metadata=meta,
                                 )
@@ -647,11 +702,22 @@ class AiRuntime:
                             self.emit_ui_event(
                                 UiEvent(
                                     role=UiRole.TOOL_RESULT,
-                                    text="Ran tool: capture_viewer_snapshot",
+                                    text="Executed: capture_viewer_snapshot",
                                     ok=False,
                                     metadata=meta,
                                 )
                             )
+                        if self.long_tool_warn_sec >= 0 and elapsed >= self.long_tool_warn_sec and not slow_tool_notice_emitted:
+                            self.emit_ui_event(
+                                UiEvent(
+                                    role=UiRole.SYSTEM,
+                                    text=(
+                                        "tool step took %.1fs; UI may be busy during heavy PyMOL operations"
+                                        % (elapsed,)
+                                    ),
+                                )
+                            )
+                            slow_tool_notice_emitted = True
 
                         content = self._tool_result_content(payload)
                         tool_msg = {
@@ -676,7 +742,7 @@ class AiRuntime:
                         self.emit_ui_event(
                             UiEvent(
                                 role=UiRole.TOOL_RESULT,
-                                text="Ran tool: %s" % (tc.name,),
+                                text="Executed: %s" % (tc.name,),
                                 ok=False,
                                 metadata={
                                     "tool_call_id": tc.tool_call_id,
@@ -712,7 +778,9 @@ class AiRuntime:
                             "skip_reason": "duplicate command skipped in current turn",
                         }
                     else:
+                        started = time.monotonic()
                         exec_result = self._run_in_gui(lambda c=command: run_pymol_command(self.cmd, c))
+                        elapsed = time.monotonic() - started
                         self._remember_tool_result(exec_result.command, exec_result.ok, exec_result.error)
                         if check_cancel():
                             return
@@ -724,12 +792,23 @@ class AiRuntime:
                         }
                         if exec_result.ok:
                             successful_commands_this_turn.add(command_key)
+                        if self.long_tool_warn_sec >= 0 and elapsed >= self.long_tool_warn_sec and not slow_tool_notice_emitted:
+                            self.emit_ui_event(
+                                UiEvent(
+                                    role=UiRole.SYSTEM,
+                                    text=(
+                                        "tool step took %.1fs; UI may be busy during heavy PyMOL operations"
+                                        % (elapsed,)
+                                    ),
+                                )
+                            )
+                            slow_tool_notice_emitted = True
 
                     result_text = self._tool_result_content(payload)
                     self.emit_ui_event(
                         UiEvent(
                             role=UiRole.TOOL_RESULT,
-                            text="Ran tool: %s" % (command,),
+                            text="Executed: %s" % (command,),
                             ok=bool(payload.get("ok")),
                             metadata={
                                 "tool_call_id": tc.tool_call_id,

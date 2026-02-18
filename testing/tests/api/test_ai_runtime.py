@@ -80,6 +80,38 @@ def _events(runtime):
     return runtime.drain_ui_events()
 
 
+def test_drain_ui_events_limit_preserves_remainder(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="one"))
+    runtime.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="two"))
+    runtime.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="three"))
+
+    first = runtime.drain_ui_events(limit=2)
+    assert [e.text for e in first] == ["one", "two"]
+    assert runtime.has_pending_ui_events()
+
+    second = runtime.drain_ui_events(limit=2)
+    assert [e.text for e in second] == ["three"]
+    assert not runtime.has_pending_ui_events()
+
+
+def test_ui_event_queue_compaction_prefers_low_priority_drop(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.ui_max_events = 3
+
+    runtime.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="s1"))
+    runtime.emit_ui_event(UiEvent(role=UiRole.REASONING, text="r1"))
+    runtime.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="s2"))
+    runtime.emit_ui_event(UiEvent(role=UiRole.USER, text="keep user"))
+    runtime.emit_ui_event(UiEvent(role=UiRole.ERROR, text="keep error"))
+
+    events = _events(runtime)
+    texts = [e.text for e in events]
+    assert "keep user" in texts
+    assert "keep error" in texts
+    assert any("compacted to keep UI responsive" in t for t in texts)
+
+
 def test_ai_controls_model_clear_and_mode(monkeypatch):
     runtime = _runtime(monkeypatch)
     runtime.history = [{"role": "user", "content": "hello"}]
@@ -398,6 +430,37 @@ def test_duplicate_command_in_turn_is_skipped(monkeypatch):
         and e.metadata.get("tool_result_json", {}).get("skipped") is True
         for e in tool_events
     )
+
+
+def test_long_tool_step_warns_once_per_turn(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.long_tool_warn_sec = 0.0
+    runtime.screenshot_validate_required = False
+    runtime._client = FakeClient([
+        {
+            "assistant_text": "running",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_1",
+                    name="run_pymol_command",
+                    arguments={"command": "zoom"},
+                    arguments_json='{"command":"zoom"}',
+                ),
+                ToolCall(
+                    tool_call_id="call_2",
+                    name="run_pymol_command",
+                    arguments={"command": "color red"},
+                    arguments_json='{"command":"color red"}',
+                ),
+            ],
+        },
+        {"assistant_text": "Done.", "tool_calls": []},
+    ])
+
+    runtime._agent_worker("do two steps")
+    events = _events(runtime)
+    warnings = [e for e in events if e.role == UiRole.SYSTEM and "tool step took" in e.text]
+    assert len(warnings) == 1
 
 
 def test_stall_loop_aborts_after_hidden_nudge(monkeypatch):
