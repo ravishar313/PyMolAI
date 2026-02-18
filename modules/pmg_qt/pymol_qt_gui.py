@@ -386,8 +386,9 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
         ai_menu = self.menudict['Display'].addMenu('AI Assistant')
         ai_reasoning_action = ai_menu.addAction('Show Reasoning')
         ai_reasoning_action.setCheckable(True)
-        runtime = self.get_ai_runtime(create=False)
+        runtime = self.get_ai_runtime(create=True)
         if runtime is not None:
+            runtime.set_ui_mode('qt')
             ai_reasoning_action.setChecked(bool(runtime.reasoning_visible))
         ai_reasoning_action.toggled.connect(self.set_ai_reasoning_visible)
 
@@ -949,11 +950,22 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
     def update_feedback(self):
         self.update_progress()
 
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            events = runtime.drain_ui_events()
+            if events:
+                html = self._render_ai_events(events)
+                self.browser.appendHtml(html)
+
         feedback = self.cmd._get_feedback()
         if feedback:
             html = colorprinting.text2html('\n'.join(feedback))
             self.browser.appendHtml(html)
 
+            scrollbar = self.browser.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+        if runtime is not None and events:
             scrollbar = self.browser.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
 
@@ -964,6 +976,49 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
                     callback(current_value)
 
         self.feedback_timer.start(500)
+
+    def _render_ai_events(self, events):
+        role_styles = {
+            'user': 'color:#1f6feb;font-weight:600;',
+            'ai': 'color:#f0f6fc;',
+            'tool_start': 'color:#e3b341;font-weight:600;',
+            'tool_result_ok': 'color:#3fb950;',
+            'tool_result_err': 'color:#f85149;',
+            'system': 'color:#ffa657;',
+            'reasoning': 'color:#8b949e;font-style:italic;',
+            'error': 'color:#ff7b72;font-weight:600;',
+        }
+        role_prefix = {
+            'user': 'USER',
+            'ai': 'AI',
+            'tool_start': 'TOOL',
+            'tool_result': 'RESULT',
+            'system': 'SYS',
+            'reasoning': 'RZN',
+            'error': 'ERR',
+        }
+
+        lines = []
+        for event in events:
+            raw_role = getattr(event, 'role', 'ai')
+            role = getattr(raw_role, 'value', raw_role)
+            role = str(role)
+            style_key = role
+            if role == 'tool_result':
+                ok = getattr(event, 'ok', None)
+                style_key = 'tool_result_ok' if ok else 'tool_result_err'
+            style = role_styles.get(style_key, role_styles['ai'])
+            prefix = role_prefix.get(role, 'AI')
+            text = colorprinting.text2html(getattr(event, 'text', ''))
+            lines.append(
+                '<span style="%s">[%s]&nbsp;</span><span style="%s">%s</span>' % (
+                    style,
+                    prefix,
+                    style,
+                    text,
+                )
+            )
+        return '<br>'.join(lines)
 
     def doPrompt(self):
         self.doTypedCommand(self.command_get())

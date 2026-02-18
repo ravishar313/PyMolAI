@@ -3,25 +3,23 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Callable, Dict, Iterable, List
+from typing import Callable, Dict, Iterable, List, Optional
 
-from .protocol import AiPlan
+from .message_types import ToolCall
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "anthropic/claude-sonnet-4"
-PLAN_JSON_START = "<PLAN_JSON>"
-PLAN_JSON_END = "</PLAN_JSON>"
 
 
 class OpenRouterClientError(RuntimeError):
     pass
 
 
-class PlanParseError(ValueError):
+class ChatParseError(ValueError):
     pass
 
 
-def _delta_to_text(delta) -> str:
+def _delta_text(delta) -> str:
     if not delta:
         return ""
 
@@ -40,45 +38,22 @@ def _delta_to_text(delta) -> str:
     return ""
 
 
-def _extract_json_block(text: str) -> Dict[str, object]:
-    if PLAN_JSON_START in text and PLAN_JSON_END in text:
-        s = text.split(PLAN_JSON_START, 1)[1].split(PLAN_JSON_END, 1)[0].strip()
-        return json.loads(s)
-
-    # fallback: best effort, parse last fenced/raw object
-    start = text.rfind("{")
-    end = text.rfind("}")
-    if start < 0 or end < 0 or end <= start:
-        raise PlanParseError("no JSON plan found in model response")
-    return json.loads(text[start : end + 1])
-
-
-def parse_plan_text(text: str) -> AiPlan:
-    try:
-        data = _extract_json_block(text)
-    except Exception as exc:  # noqa: BLE001
-        raise PlanParseError(str(exc)) from exc
-
-    try:
-        return AiPlan.from_dict(data)
-    except Exception as exc:  # noqa: BLE001
-        raise PlanParseError(str(exc)) from exc
-
-
 class OpenRouterClient:
-    def __init__(self, api_key: str, base_url: str | None = None):
+    def __init__(self, api_key: str, base_url: Optional[str] = None):
         if not api_key:
             raise OpenRouterClientError("OPENROUTER_API_KEY is required")
         self.api_key = api_key
         self.base_url = base_url or os.getenv("OPENROUTER_BASE_URL") or DEFAULT_BASE_URL
 
-    async def _stream_chat(
+    async def _stream_chat_completion(
         self,
         *,
         model: str,
-        messages: Iterable[Dict[str, str]],
-        on_chunk: Callable[[str], None],
-    ) -> str:
+        messages: Iterable[Dict[str, object]],
+        tools: Optional[List[Dict[str, object]]],
+        on_text_chunk: Callable[[str], None],
+        on_reasoning_chunk: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, object]:
         try:
             from openai import AsyncOpenAI
         except Exception as exc:  # noqa: BLE001
@@ -87,45 +62,123 @@ class OpenRouterClient:
             ) from exc
 
         client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
-        response_stream = await client.chat.completions.create(
-            model=model,
-            temperature=0.2,
-            stream=True,
-            messages=list(messages),
-        )
 
-        chunks: List[str] = []
-        async for event in response_stream:
+        req: Dict[str, object] = {
+            "model": model,
+            "messages": list(messages),
+            "temperature": 0.2,
+            "stream": True,
+        }
+        if tools:
+            req["tools"] = tools
+            req["parallel_tool_calls"] = False
+
+        try:
+            stream = await client.chat.completions.create(**req)
+        except Exception as exc:  # noqa: BLE001
+            raise OpenRouterClientError(str(exc)) from exc
+
+        text_chunks: List[str] = []
+        reasoning_chunks: List[str] = []
+        tool_calls_accum: Dict[int, Dict[str, object]] = {}
+
+        async for event in stream:
             choices = getattr(event, "choices", None) or []
             if not choices:
                 continue
-            delta = getattr(choices[0], "delta", None)
-            text = _delta_to_text(delta)
+
+            choice = choices[0]
+            delta = getattr(choice, "delta", None)
+            if not delta:
+                continue
+
+            text = _delta_text(delta)
             if text:
-                chunks.append(text)
-                on_chunk(text)
+                text_chunks.append(text)
+                on_text_chunk(text)
 
-        return "".join(chunks)
+            reasoning = getattr(delta, "reasoning", None)
+            if isinstance(reasoning, str) and reasoning:
+                reasoning_chunks.append(reasoning)
+                if on_reasoning_chunk:
+                    on_reasoning_chunk(reasoning)
 
-    def stream_plan(
+            delta_tool_calls = getattr(delta, "tool_calls", None) or []
+            for tc in delta_tool_calls:
+                idx = getattr(tc, "index", None)
+                if idx is None:
+                    continue
+
+                existing = tool_calls_accum.get(
+                    idx,
+                    {
+                        "id": None,
+                        "type": "function",
+                        "function": {"name": None, "arguments": ""},
+                    },
+                )
+
+                tc_id = getattr(tc, "id", None)
+                if tc_id:
+                    existing["id"] = tc_id
+
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    fn_name = getattr(fn, "name", None)
+                    if fn_name:
+                        existing["function"]["name"] = fn_name
+
+                    fn_args = getattr(fn, "arguments", None)
+                    if isinstance(fn_args, str) and fn_args:
+                        existing["function"]["arguments"] += fn_args
+
+                tool_calls_accum[idx] = existing
+
+        tool_calls: List[ToolCall] = []
+        for idx in sorted(tool_calls_accum.keys()):
+            call = tool_calls_accum[idx]
+            fn = call.get("function", {})
+            name = str(fn.get("name") or "")
+            arguments_json = str(fn.get("arguments") or "{}")
+            try:
+                arguments = json.loads(arguments_json)
+                if not isinstance(arguments, dict):
+                    arguments = {"value": arguments}
+            except Exception:
+                arguments = {"raw": arguments_json}
+
+            call_id = str(call.get("id") or ("tool_%d" % idx))
+            if name:
+                tool_calls.append(
+                    ToolCall(
+                        tool_call_id=call_id,
+                        name=name,
+                        arguments=arguments,
+                        arguments_json=arguments_json,
+                    )
+                )
+
+        return {
+            "assistant_text": "".join(text_chunks),
+            "reasoning": "".join(reasoning_chunks),
+            "tool_calls": tool_calls,
+        }
+
+    def stream_assistant_turn(
         self,
         *,
         model: str,
-        messages: Iterable[Dict[str, str]],
-        on_chunk: Callable[[str], None],
-    ) -> AiPlan:
-        text = asyncio.run(
-            self._stream_chat(model=model, messages=messages, on_chunk=on_chunk)
-        )
-        return parse_plan_text(text)
-
-    def stream_text(
-        self,
-        *,
-        model: str,
-        messages: Iterable[Dict[str, str]],
-        on_chunk: Callable[[str], None],
-    ) -> str:
+        messages: Iterable[Dict[str, object]],
+        tools: Optional[List[Dict[str, object]]],
+        on_text_chunk: Callable[[str], None],
+        on_reasoning_chunk: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, object]:
         return asyncio.run(
-            self._stream_chat(model=model, messages=messages, on_chunk=on_chunk)
+            self._stream_chat_completion(
+                model=model,
+                messages=messages,
+                tools=tools,
+                on_text_chunk=on_text_chunk,
+                on_reasoning_chunk=on_reasoning_chunk,
+            )
         )

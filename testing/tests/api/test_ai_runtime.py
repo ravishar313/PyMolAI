@@ -1,9 +1,6 @@
 from types import SimpleNamespace
 
-import pytest
-
-from pymol.ai.openrouter_client import PlanParseError, parse_plan_text
-from pymol.ai.protocol import AiPlan
+from pymol.ai.message_types import ToolCall, UiRole
 from pymol.ai.runtime import AiRuntime
 from pymol.shortcut import Shortcut
 
@@ -25,12 +22,26 @@ class DummyCmd:
         self._call_in_gui_thread = lambda fn: fn()
 
 
+class FakeClient:
+    def __init__(self, turns):
+        self.turns = list(turns)
+
+    def stream_assistant_turn(self, **kwargs):
+        if not self.turns:
+            return {"assistant_text": "", "tool_calls": []}
+        return self.turns.pop(0)
+
+
 def _runtime(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.delenv("PYMOL_AI_DISABLE", raising=False)
     runtime = AiRuntime(DummyCmd())
-    runtime.final_answer_enabled = False
+    runtime.set_ui_mode("qt")
     return runtime
+
+
+def _events(runtime):
+    return runtime.drain_ui_events()
 
 
 def test_ai_controls_model_clear_and_mode(monkeypatch):
@@ -48,35 +59,26 @@ def test_ai_controls_model_clear_and_mode(monkeypatch):
     assert runtime.history == []
 
 
-def test_missing_api_key_does_not_enable(monkeypatch, capsys):
+def test_missing_api_key_does_not_enable(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     runtime = AiRuntime(DummyCmd())
+    runtime.set_ui_mode("qt")
+
     runtime.handle_typed_input("/ai on")
-    out, _ = capsys.readouterr()
-    assert "OPENROUTER_API_KEY is not set" in out
     assert not runtime.enabled
+    assert any("OPENROUTER_API_KEY is not set" in e.text for e in _events(runtime))
 
 
-def test_ai_mode_routes_regular_text_to_ai(monkeypatch):
+def test_ai_mode_routes_text_to_agent(monkeypatch):
     runtime = _runtime(monkeypatch)
     calls = []
-    runtime._start_plan_request = lambda prompt: calls.append(prompt)
+    runtime._start_agent_request = lambda prompt: calls.append(prompt)
 
     assert runtime.handle_typed_input("show cartoon") is True
     assert calls == ["show cartoon"]
 
 
-def test_disabled_ai_consumes_input_with_message(monkeypatch, capsys):
-    runtime = _runtime(monkeypatch)
-    runtime.enabled = False
-
-    assert runtime.handle_typed_input("show cartoon") is True
-    out, _ = capsys.readouterr()
-    assert "disabled" in out
-    assert runtime.cmd._parser.commands == []
-
-
-def test_cli_mode_persistent_executes_directly(monkeypatch):
+def test_cli_mode_and_one_off(monkeypatch):
     runtime = _runtime(monkeypatch)
 
     runtime.handle_typed_input("/cli")
@@ -84,82 +86,134 @@ def test_cli_mode_persistent_executes_directly(monkeypatch):
 
     runtime.handle_typed_input("zoom")
     assert runtime.cmd._parser.commands == ["zoom"]
-    assert any("CLI command: zoom" in x["content"] for x in runtime.history)
 
-
-def test_cli_one_off_executes_without_switching_mode(monkeypatch):
-    runtime = _runtime(monkeypatch)
-    assert runtime.input_mode == "ai"
-
-    runtime.handle_typed_input("/cli color red")
-    assert runtime.cmd._parser.commands == ["color red"]
-    assert runtime.input_mode == "ai"
-
-
-def test_cli_one_off_load_pdbid_translates_to_fetch(monkeypatch):
-    runtime = _runtime(monkeypatch)
+    runtime.handle_typed_input("/ai")
     runtime.handle_typed_input("/cli load 1bom")
-    assert runtime.cmd._parser.commands == ["fetch 1bom"]
+    assert runtime.cmd._parser.commands[-1] == "fetch 1bom"
 
 
-def test_handle_plan_success_auto_executes(monkeypatch):
+def test_agent_no_tool_call_means_final_answer(monkeypatch):
     runtime = _runtime(monkeypatch)
-    plan = AiPlan(summary="style", commands=["show cartoon", "color chain"])
+    runtime._client = FakeClient([
+        {"assistant_text": "Done. Ligands are FMN and D59.", "tool_calls": []}
+    ])
 
-    runtime._handle_plan_success("style this", plan)
+    runtime._agent_worker("what ligands are there")
 
-    assert runtime.cmd._parser.commands == ["show cartoon", "color chain"]
+    events = _events(runtime)
+    assert any(e.role == UiRole.AI and "Ligands" in e.text for e in events)
+    assert runtime.history[-1]["role"] == "assistant"
 
 
-def test_execution_stops_on_first_failure(monkeypatch):
+def test_agent_tool_call_then_final_answer(monkeypatch):
     runtime = _runtime(monkeypatch)
-    plan = AiPlan(summary="mixed", commands=["show cartoon", "bad_command", "color chain"])
+    runtime._client = FakeClient([
+        {
+            "assistant_text": "I will zoom.",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_1",
+                    name="run_pymol_command",
+                    arguments={"command": "zoom"},
+                    arguments_json='{"command":"zoom"}',
+                )
+            ],
+        },
+        {"assistant_text": "Zoom complete.", "tool_calls": []},
+    ])
 
-    runtime._execute_plan(plan)
+    runtime._agent_worker("zoom in")
 
-    assert runtime.cmd._parser.commands == ["show cartoon", "bad_command"]
+    assert runtime.cmd._parser.commands == ["zoom"]
+    assert any(m.get("role") == "tool" for m in runtime.history)
 
 
-def test_auto_repair_continues_after_failure(monkeypatch):
+def test_tool_failure_is_returned_to_loop(monkeypatch):
     runtime = _runtime(monkeypatch)
-    runtime.max_auto_repairs = 1
-    runtime._repair_plan = lambda *_: AiPlan(summary="repair", commands=["color chain"])
-    plan = AiPlan(summary="mixed", commands=["bad_command"])
+    runtime._client = FakeClient([
+        {
+            "assistant_text": "Trying first approach.",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_1",
+                    name="run_pymol_command",
+                    arguments={"command": "bad_command"},
+                    arguments_json='{"command":"bad_command"}',
+                )
+            ],
+        },
+        {
+            "assistant_text": "Trying corrected command.",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_2",
+                    name="run_pymol_command",
+                    arguments={"command": "color red"},
+                    arguments_json='{"command":"color red"}',
+                )
+            ],
+        },
+        {"assistant_text": "Done.", "tool_calls": []},
+    ])
 
-    runtime._execute_until_complete("style", plan)
+    runtime._agent_worker("make it red")
 
-    assert runtime.cmd._parser.commands == ["bad_command", "color chain"]
-
-
-def test_model_response_parser_failure_is_safe():
-    with pytest.raises(PlanParseError):
-        parse_plan_text("not-json")
+    assert runtime.cmd._parser.commands == ["bad_command", "color red"]
 
 
-def test_model_response_parser_with_plan_json():
-    text = (
-        "assistant text\\n<PLAN_JSON>"
-        '{"summary":"style","commands":["show cartoon","zoom"],"warnings":[]}'
-        "</PLAN_JSON>"
-    )
-    plan = parse_plan_text(text)
-    assert plan.summary == "style"
-    assert plan.commands == ["show cartoon", "zoom"]
-
-
-def test_runtime_normalizes_multiline_plan(monkeypatch):
+def test_doom_loop_warning_injected(monkeypatch):
     runtime = _runtime(monkeypatch)
-    plan = AiPlan(summary="style", commands=["show cartoon;color chain\nzoom"])
-    normalized = runtime._normalize_plan(plan)
-    assert normalized.commands == ["show cartoon", "color chain", "zoom"]
+    runtime.doom_loop_threshold = 2
+    runtime._client = FakeClient([
+        {
+            "assistant_text": "Try 1",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_1",
+                    name="run_pymol_command",
+                    arguments={"command": "zoom"},
+                    arguments_json='{"command":"zoom"}',
+                )
+            ],
+        },
+        {
+            "assistant_text": "Try 2",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_2",
+                    name="run_pymol_command",
+                    arguments={"command": "zoom"},
+                    arguments_json='{"command":"zoom"}',
+                )
+            ],
+        },
+        {"assistant_text": "Done", "tool_calls": []},
+    ])
+
+    runtime._agent_worker("zoom")
+
+    events = _events(runtime)
+    assert any(e.role == UiRole.SYSTEM and "DOOM LOOP DETECTED" in e.text for e in events)
 
 
-def test_stream_filter_hides_plan_json(monkeypatch, capsys):
+def test_step_limit_has_explicit_error(monkeypatch):
     runtime = _runtime(monkeypatch)
-    runtime._emit_chunk("thinking...\n<PLAN_JSON>{\"summary\":\"s\",")
-    runtime._emit_chunk("\"commands\":[\"zoom\"]}</PLAN_JSON>\n")
-    runtime._flush_chunks()
-    out, _ = capsys.readouterr()
-    assert "thinking..." in out
-    assert "<PLAN_JSON>" not in out
-    assert "\"commands\"" not in out
+    runtime.max_agent_steps = 1
+    runtime._client = FakeClient([
+        {
+            "assistant_text": "working",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_1",
+                    name="run_pymol_command",
+                    arguments={"command": "zoom"},
+                    arguments_json='{"command":"zoom"}',
+                )
+            ],
+        }
+    ])
+
+    runtime._agent_worker("zoom a lot")
+
+    events = _events(runtime)
+    assert any(e.role == UiRole.ERROR and "step limit" in e.text for e in events)
