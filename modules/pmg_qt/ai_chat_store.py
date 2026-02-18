@@ -116,16 +116,21 @@ class AiChatStore:
             handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     def _index_row_from_manifest(self, manifest: Dict[str, Any]) -> Dict[str, Any]:
+        message_count = int(manifest.get("message_count") or 0)
         save_status = manifest.get("save_status") or {}
         return {
             "chat_id": manifest.get("chat_id"),
             "title": manifest.get("title") or "",
             "updated_at": manifest.get("updated_at") or "",
             "preview": manifest.get("preview") or "",
-            "message_count": int(manifest.get("message_count") or 0),
+            "message_count": message_count,
             "has_session_pse": bool(manifest.get("has_session_pse")),
             "last_pse_save_ok": bool(save_status.get("last_pse_save_ok", True)),
         }
+
+    @staticmethod
+    def _is_visible_chat_row(row: Dict[str, Any]) -> bool:
+        return int(row.get("message_count") or 0) > 0
 
     def _load_index_cache(self) -> None:
         self._index_latest = {}
@@ -145,7 +150,10 @@ class AiChatStore:
                     if row.get("deleted"):
                         self._index_latest.pop(chat_id, None)
                     else:
-                        self._index_latest[chat_id] = row
+                        if self._is_visible_chat_row(row):
+                            self._index_latest[chat_id] = row
+                        else:
+                            self._index_latest.pop(chat_id, None)
 
         if self._index_latest:
             return
@@ -164,7 +172,9 @@ class AiChatStore:
             chat_id = str(manifest.get("chat_id") or "").strip()
             if not chat_id:
                 continue
-            self._index_latest[chat_id] = self._index_row_from_manifest(manifest)
+            row = self._index_row_from_manifest(manifest)
+            if self._is_visible_chat_row(row):
+                self._index_latest[chat_id] = row
 
     def _ensure_events_handle(self) -> None:
         if self._events_fp is not None:
@@ -190,7 +200,7 @@ class AiChatStore:
 
     def list_chats(self, query: str = "", offset: int = 0, limit: int = 30) -> List[Dict[str, Any]]:
         query_low = str(query or "").strip().lower()
-        rows = list(self._index_latest.values())
+        rows = [row for row in self._index_latest.values() if self._is_visible_chat_row(row)]
         rows.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
         if query_low:
             rows = [
@@ -235,6 +245,10 @@ class AiChatStore:
         self.flush_now()
         self._close_events_handle()
 
+        # Drop prior empty draft before creating another draft chat.
+        if self.current_chat_id and self._manifest and int(self._manifest.get("message_count") or 0) == 0:
+            self.delete_chat(self.current_chat_id)
+
         chat_id = self._new_chat_id(title_hint=title_hint)
         chat_dir = self.root_dir / chat_id
         chat_dir.mkdir(parents=True, exist_ok=True)
@@ -249,10 +263,9 @@ class AiChatStore:
         self._checkpoint_due_at = None
         self._pending_event_lines = []
         self._manifest_dirty = False
-        self._index_dirty = True
+        self._index_dirty = False
         self._touch_flush_deadline()
         self._ensure_events_handle()
-        self.flush_now()
         return chat_id
 
     def open_chat(self, chat_id: str) -> bool:
@@ -339,7 +352,8 @@ class AiChatStore:
         self._manifest["runtime_state"] = self._sanitize_runtime_state(state)
         self._manifest["updated_at"] = self._now_iso()
         self._manifest_dirty = True
-        self._index_dirty = True
+        if int(self._manifest.get("message_count") or 0) > 0:
+            self._index_dirty = True
         self._touch_flush_deadline()
 
     def append_events(self, chat_id: str, events: Iterable[Any]) -> int:
@@ -454,8 +468,12 @@ class AiChatStore:
 
         if self._index_dirty:
             row = self._index_row_from_manifest(self._manifest)
-            self._index_latest[self.current_chat_id] = row
-            self._append_index_row(row)
+            if self._is_visible_chat_row(row):
+                self._index_latest[self.current_chat_id] = row
+                self._append_index_row(row)
+            elif self.current_chat_id in self._index_latest:
+                self._index_latest.pop(self.current_chat_id, None)
+                self._append_index_row({"chat_id": self.current_chat_id, "deleted": True, "updated_at": self._now_iso()})
             self._index_dirty = False
 
         self._flush_due_at = None

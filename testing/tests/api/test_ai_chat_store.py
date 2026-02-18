@@ -93,9 +93,15 @@ def test_load_chat_with_missing_session_keeps_transcript(tmp_path):
 
 def test_delete_oldest_reduces_count(tmp_path):
     store = _store(tmp_path)
-    store.create_chat("a")
-    store.create_chat("b")
-    store.create_chat("c")
+    chat_a = store.create_chat("a")
+    store.append_events(chat_a, [{"role": "user", "text": "a", "metadata": {}}])
+    store.flush_now()
+    chat_b = store.create_chat("b")
+    store.append_events(chat_b, [{"role": "user", "text": "b", "metadata": {}}])
+    store.flush_now()
+    chat_c = store.create_chat("c")
+    store.append_events(chat_c, [{"role": "user", "text": "c", "metadata": {}}])
+    store.flush_now()
 
     before = store.count_chats()
     deleted = store.delete_oldest(2)
@@ -119,3 +125,15 @@ def test_runtime_state_is_truncated_and_mode_sanitized(tmp_path):
     assert state["input_mode"] == "cli"
     assert len(state["history"]) == 80
     assert isinstance(state["model_info"], dict)
+
+
+def test_empty_chats_are_not_listed(tmp_path):
+    store = _store(tmp_path)
+    store.create_chat("empty")
+    store.flush_now()
+    assert store.count_chats() == 0
+
+    chat_id = store.create_chat("non-empty")
+    store.append_events(chat_id, [{"role": "user", "text": "hello", "metadata": {}}])
+    store.flush_now()
+    assert store.count_chats() == 1
