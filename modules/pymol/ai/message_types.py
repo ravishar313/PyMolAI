@@ -29,3 +29,10 @@ class ToolCall:
     name: str
     arguments: Dict[str, Any]
     arguments_json: str = "{}"
+
+
+@dataclass
+class VisualValidation:
+    validated: bool
+    used_screenshot: bool
+    warning: str = ""

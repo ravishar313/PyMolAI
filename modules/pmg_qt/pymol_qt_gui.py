@@ -1010,12 +1010,20 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
             style = role_styles.get(style_key, role_styles['ai'])
             prefix = role_prefix.get(role, 'AI')
             text = colorprinting.text2html(getattr(event, 'text', ''))
+            metadata = getattr(event, 'metadata', {}) or {}
+            badge = ''
+            vv = metadata.get('visual_validation')
+            if vv:
+                badge = '&nbsp;<span style="color:#8b949e;">(%s)</span>' % (
+                    colorprinting.text2html(str(vv), whitespace=False),
+                )
             lines.append(
-                '<span style="%s">[%s]&nbsp;</span><span style="%s">%s</span>' % (
+                '<span style="%s">[%s]&nbsp;</span><span style="%s">%s</span>%s' % (
                     style,
                     prefix,
                     style,
                     text,
+                    badge,
                 )
             )
         return '<br>'.join(lines)

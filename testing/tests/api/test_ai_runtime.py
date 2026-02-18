@@ -20,6 +20,34 @@ class DummyCmd:
         self._parser = DummyParser()
         self._pymol = SimpleNamespace()
         self._call_in_gui_thread = lambda fn: fn()
+        self._snapshot_idx = 0
+
+    def get_names(self, type_name, enabled_only=0):
+        if type_name == "objects":
+            return ["obj1"] if enabled_only else ["obj1", "obj2"]
+        if type_name == "public_selections":
+            return ["sel1"]
+        return []
+
+    def count_atoms(self, selection):
+        return 12
+
+    def get_vis(self):
+        return {"obj1": 1}
+
+    def get_view(self, output=0, quiet=1):
+        return [0.0] * 18
+
+    def get_viewport(self, output=0, quiet=1):
+        return [800, 600]
+
+    def get_object_list(self, selection="(all)", quiet=1):
+        return ["obj1"]
+
+    def png(self, path, width=0, height=0, ray=0, quiet=1, prior=0):
+        self._snapshot_idx += 1
+        with open(path, "wb") as handle:
+            handle.write(b"\x89PNG\r\n\x1a\n" + bytes([self._snapshot_idx]))
 
 
 class FakeClient:
@@ -126,6 +154,7 @@ def test_no_duplicate_ai_message_when_streaming_no_tools(monkeypatch):
 
 def test_agent_tool_call_then_final_answer(monkeypatch):
     runtime = _runtime(monkeypatch)
+    runtime.screenshot_validate_required = False
     runtime._client = FakeClient([
         {
             "assistant_text": "I will zoom.",
@@ -149,6 +178,7 @@ def test_agent_tool_call_then_final_answer(monkeypatch):
 
 def test_tool_failure_is_returned_to_loop(monkeypatch):
     runtime = _runtime(monkeypatch)
+    runtime.screenshot_validate_required = False
     runtime._client = FakeClient([
         {
             "assistant_text": "Trying first approach.",
@@ -236,3 +266,75 @@ def test_step_limit_has_explicit_error(monkeypatch):
 
     events = _events(runtime)
     assert any(e.role == UiRole.ERROR and "step limit" in e.text for e in events)
+
+
+def test_validation_required_inserts_snapshot_turn(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.screenshot_validate_required = True
+    runtime._client = FakeClient([
+        {
+            "assistant_text": "run command",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_1",
+                    name="run_pymol_command",
+                    arguments={"command": "zoom"},
+                    arguments_json='{"command":"zoom"}',
+                )
+            ],
+        },
+        {
+            "assistant_text": "validating",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_2",
+                    name="capture_viewer_snapshot",
+                    arguments={"purpose": "validate"},
+                    arguments_json='{"purpose":"validate"}',
+                )
+            ],
+        },
+        {"assistant_text": "Done", "tool_calls": []},
+    ])
+
+    runtime._agent_worker("zoom then answer")
+    events = _events(runtime)
+    assert any(e.role == UiRole.TOOL_START and "capture_viewer_snapshot" in e.text for e in events)
+    assert any(
+        e.role == UiRole.TOOL_RESULT
+        and e.metadata.get("visual_validation") == "validated: screenshot+state"
+        for e in events
+    )
+
+
+def test_snapshot_failure_fallback_warning(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.screenshot_validate_required = True
+
+    def failing_png(path, width=0, height=0, ray=0, quiet=1, prior=0):
+        raise RuntimeError("png failed")
+
+    runtime.cmd.png = failing_png
+    runtime._client = FakeClient([
+        {
+            "assistant_text": "validate",
+            "tool_calls": [
+                ToolCall(
+                    tool_call_id="call_1",
+                    name="capture_viewer_snapshot",
+                    arguments={},
+                    arguments_json="{}",
+                )
+            ],
+        },
+        {"assistant_text": "done", "tool_calls": []},
+    ])
+
+    runtime._agent_worker("check")
+    events = _events(runtime)
+    assert any(e.role == UiRole.TOOL_RESULT and e.ok is False for e in events)
+    assert any(
+        e.role == UiRole.TOOL_RESULT
+        and e.metadata.get("visual_validation") == "validated: state-only (screenshot failed)"
+        for e in events
+    )

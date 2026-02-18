@@ -4,12 +4,19 @@ import json
 import os
 import re
 import threading
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .doom_loop_detector import DoomLoopDetector
 from .message_types import ToolCall, UiEvent, UiRole
-from .openrouter_client import DEFAULT_MODEL, OpenRouterClient, OpenRouterClientError
+from .openrouter_client import (
+    DEFAULT_MODEL,
+    OpenRouterClient,
+    OpenRouterClientError,
+    build_multimodal_user_content,
+)
+from .state_snapshot import build_viewer_state_snapshot
 from .tool_execution import run_pymol_command
+from .vision_capture import capture_viewer_snapshot
 
 SYSTEM_PROMPT = """You are a PyMOL desktop agent.
 You can either:
@@ -23,6 +30,14 @@ Rules:
 - Prefer continuing current session state; avoid redundant fetch/load.
 - Keep answers concise and practical.
 """
+
+_READ_ONLY_PREFIXES = (
+    "get_",
+    "count_",
+    "iterate",
+    "indicate",
+    "help",
+)
 
 _RE_PDB_ID = re.compile(r"^[0-9][A-Za-z0-9]{3}$")
 
@@ -48,6 +63,12 @@ class AiRuntime:
         self.tool_result_max_chars = _env_int("PYMOL_AI_TOOL_RESULT_MAX_CHARS", 4096)
         self.doom_loop_threshold = _env_int("PYMOL_AI_DOOM_LOOP_THRESHOLD", 3)
 
+        self.screenshot_width = _env_int("PYMOL_AI_SCREENSHOT_WIDTH", 1024)
+        self.screenshot_height = _env_int("PYMOL_AI_SCREENSHOT_HEIGHT", 0)
+        self.screenshot_validate_required = _env_int("PYMOL_AI_SCREENSHOT_VALIDATE_REQUIRED", 1) == 1
+        self.state_max_selections = _env_int("PYMOL_AI_STATE_MAX_SELECTIONS", 20)
+        self.state_max_objects = _env_int("PYMOL_AI_STATE_MAX_OBJECTS", 30)
+
         self._busy = False
         self._lock = threading.Lock()
         self._event_lock = threading.Lock()
@@ -61,6 +82,7 @@ class AiRuntime:
         self.enabled = bool(self._api_key) and not disabled
 
         self._client: Optional[OpenRouterClient] = None
+        self._recent_tool_results: List[Dict[str, object]] = []
 
     @property
     def _api_key(self) -> str:
@@ -210,6 +232,7 @@ class AiRuntime:
         if action == "clear":
             self.history.clear()
             self._stream_line_buffer = ""
+            self._recent_tool_results.clear()
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="session memory cleared"))
             return
 
@@ -236,9 +259,46 @@ class AiRuntime:
         if len(self.history) > 80:
             self.history = self.history[-80:]
 
-    def _build_messages(self, prompt: str) -> List[Dict[str, object]]:
-        msgs: List[Dict[str, object]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    def _state_summary_for_prompt(self) -> Dict[str, object]:
+        return self._run_in_gui(
+            lambda: build_viewer_state_snapshot(
+                self.cmd,
+                max_objects=self.state_max_objects,
+                max_selections=self.state_max_selections,
+                recent_tool_results=self._recent_tool_results,
+            )
+        )
+
+    def _build_messages(
+        self,
+        prompt: str,
+        *,
+        snapshot_image_data_url: Optional[str] = None,
+        snapshot_state_summary: Optional[Dict[str, object]] = None,
+    ) -> List[Dict[str, object]]:
+        state_summary = snapshot_state_summary or self._state_summary_for_prompt()
+
+        msgs: List[Dict[str, object]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": "Current viewer state (compact JSON):\n%s"
+                % (json.dumps(state_summary, ensure_ascii=False),),
+            },
+        ]
         msgs.extend(self.history[-60:])
+
+        if snapshot_image_data_url:
+            msgs.append(
+                {
+                    "role": "user",
+                    "content": build_multimodal_user_content(
+                        "Visual validation context for current viewer state.",
+                        snapshot_image_data_url,
+                    ),
+                }
+            )
+
         msgs.append({"role": "user", "content": prompt})
         return msgs
 
@@ -259,7 +319,25 @@ class AiRuntime:
                         "additionalProperties": False,
                     },
                 },
-            }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "capture_viewer_snapshot",
+                    "description": (
+                        "Capture current PyMOL viewport screenshot and compact viewer state summary. "
+                        "Use for visual validation before final answer when scene changed."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "purpose": {"type": "string"},
+                        },
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            },
         ]
 
     def _on_assistant_chunk(self, chunk: str) -> None:
@@ -285,6 +363,26 @@ class AiRuntime:
                 return "fetch %s" % (arg,), "translated load %s -> fetch %s" % (arg, arg)
         return stripped, None
 
+    def _is_state_changing_command(self, command: str) -> bool:
+        text = str(command or "").strip().lower()
+        if not text:
+            return False
+        first = text.split(None, 1)[0]
+        if first.startswith(_READ_ONLY_PREFIXES):
+            return False
+        return True
+
+    def _remember_tool_result(self, command: str, ok: bool, error: str) -> None:
+        self._recent_tool_results.append(
+            {
+                "command": command,
+                "ok": ok,
+                "error": error[:240] if error else "",
+            }
+        )
+        if len(self._recent_tool_results) > 20:
+            self._recent_tool_results = self._recent_tool_results[-20:]
+
     def _execute_cli_command(self, command: str) -> None:
         fixed, note = self._canonicalize_command(command)
         if note:
@@ -292,6 +390,8 @@ class AiRuntime:
 
         self._append_history({"role": "user", "content": "CLI command: %s" % (fixed,)})
         result = self._run_in_gui(lambda c=fixed: run_pymol_command(self.cmd, c))
+        self._remember_tool_result(result.command, result.ok, result.error)
+
         if result.ok:
             lines = "\n".join(result.feedback_lines) if result.feedback_lines else "ok"
             self.emit_ui_event(UiEvent(role=UiRole.TOOL_RESULT, text=lines, ok=True))
@@ -313,23 +413,53 @@ class AiRuntime:
             )
         return {"role": "assistant", "content": assistant_text, "tool_calls": tc_payload}
 
-    def _tool_result_content(self, ok: bool, command: str, error: str, feedback_lines: List[str]) -> str:
-        payload = {
-            "ok": ok,
-            "command": command,
-            "error": error or None,
-            "feedback_lines": feedback_lines,
-        }
+    def _tool_result_content(self, payload: Dict[str, object]) -> str:
         return json.dumps(payload, ensure_ascii=False)
+
+    def _execute_snapshot_tool(self) -> Tuple[Dict[str, object], Optional[str], Dict[str, object]]:
+        capture = self._run_in_gui(
+            lambda: capture_viewer_snapshot(
+                self.cmd,
+                width=self.screenshot_width,
+                height=self.screenshot_height,
+            )
+        )
+
+        state_summary = self._state_summary_for_prompt()
+        image_data_url = capture.get("image_data_url") if capture.get("ok") else None
+
+        payload = {
+            "ok": bool(capture.get("ok")),
+            "error": capture.get("error"),
+            "meta": capture.get("meta", {}),
+            "state_summary": state_summary,
+            "used_screenshot": bool(capture.get("ok")),
+        }
+
+        return payload, image_data_url, state_summary
 
     def _agent_worker(self, prompt: str) -> None:
         detector = DoomLoopDetector(threshold=self.doom_loop_threshold)
-        messages = self._build_messages(prompt)
+
+        snapshot_image_data_url: Optional[str] = None
+        snapshot_state_summary: Optional[Dict[str, object]] = None
 
         try:
             self._append_history({"role": "user", "content": prompt})
 
+            pending_validation_required = False
+            validation_done_this_turn = False
+
             for step in range(1, self.max_agent_steps + 1):
+                messages = self._build_messages(
+                    prompt,
+                    snapshot_image_data_url=snapshot_image_data_url,
+                    snapshot_state_summary=snapshot_state_summary,
+                )
+
+                # Ephemeral image: use for immediate call and then clear.
+                snapshot_image_data_url = None
+
                 self._stream_had_output = False
                 turn = self._client_or_error().stream_assistant_turn(
                     model=self.model,
@@ -346,7 +476,16 @@ class AiRuntime:
                 tool_calls = list(turn.get("tool_calls") or [])
 
                 if not tool_calls:
-                    # Avoid duplicate final answer if it was already fully streamed.
+                    if self.screenshot_validate_required and pending_validation_required and not validation_done_this_turn:
+                        nudge = (
+                            "Validation required: capture_viewer_snapshot must be called before final answer "
+                            "because scene-changing commands were executed."
+                        )
+                        self._append_history({"role": "system", "content": nudge})
+                        self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text=nudge))
+                        continue
+
+                    # Avoid duplicate final answer if already streamed.
                     if assistant_text:
                         if not self._stream_had_output:
                             self.emit_ui_event(UiEvent(role=UiRole.AI, text=assistant_text))
@@ -361,26 +500,54 @@ class AiRuntime:
                     return
 
                 self._append_history(self._assistant_message_with_tools(assistant_text, tool_calls))
-                messages.append(self._assistant_message_with_tools(assistant_text, tool_calls))
+
+                validation_done_this_turn = False
 
                 for tc in tool_calls:
+                    if tc.name == "capture_viewer_snapshot":
+                        self.emit_ui_event(UiEvent(role=UiRole.TOOL_START, text="capture_viewer_snapshot"))
+
+                        payload, image_data_url, state_summary = self._execute_snapshot_tool()
+                        snapshot_image_data_url = image_data_url
+                        snapshot_state_summary = state_summary
+
+                        if payload["ok"]:
+                            txt = "viewer snapshot captured (%s bytes)" % payload.get("meta", {}).get("bytes", "?")
+                            meta = {"visual_validation": "validated: screenshot+state"}
+                            self.emit_ui_event(UiEvent(role=UiRole.TOOL_RESULT, text=txt, ok=True, metadata=meta))
+                        else:
+                            txt = "viewer snapshot failed: %s" % (payload.get("error") or "unknown error")
+                            meta = {"visual_validation": "validated: state-only (screenshot failed)"}
+                            self.emit_ui_event(UiEvent(role=UiRole.TOOL_RESULT, text=txt, ok=False, metadata=meta))
+
+                        content = self._tool_result_content(payload)
+                        tool_msg = {
+                            "role": "tool",
+                            "tool_call_id": tc.tool_call_id,
+                            "name": tc.name,
+                            "content": content,
+                        }
+                        self._append_history(tool_msg)
+                        validation_done_this_turn = True
+                        pending_validation_required = False
+                        continue
+
                     if tc.name != "run_pymol_command":
-                        err_content = self._tool_result_content(
-                            ok=False,
-                            command="",
-                            error="unsupported tool: %s" % (tc.name,),
-                            feedback_lines=[],
-                        )
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tc.tool_call_id,
-                                "name": tc.name,
-                                "content": err_content,
-                            }
-                        )
-                        self._append_history(messages[-1])
+                        payload = {
+                            "ok": False,
+                            "command": "",
+                            "error": "unsupported tool: %s" % (tc.name,),
+                            "feedback_lines": [],
+                        }
+                        err_content = self._tool_result_content(payload)
                         self.emit_ui_event(UiEvent(role=UiRole.TOOL_RESULT, text=err_content, ok=False))
+                        tool_msg = {
+                            "role": "tool",
+                            "tool_call_id": tc.tool_call_id,
+                            "name": tc.name,
+                            "content": err_content,
+                        }
+                        self._append_history(tool_msg)
                         continue
 
                     command = str(tc.arguments.get("command") or "").strip()
@@ -390,13 +557,15 @@ class AiRuntime:
 
                     self.emit_ui_event(UiEvent(role=UiRole.TOOL_START, text=command))
                     exec_result = self._run_in_gui(lambda c=command: run_pymol_command(self.cmd, c))
+                    self._remember_tool_result(exec_result.command, exec_result.ok, exec_result.error)
 
-                    result_text = self._tool_result_content(
-                        ok=exec_result.ok,
-                        command=exec_result.command,
-                        error=exec_result.error,
-                        feedback_lines=exec_result.feedback_lines,
-                    )
+                    payload = {
+                        "ok": exec_result.ok,
+                        "command": exec_result.command,
+                        "error": exec_result.error or None,
+                        "feedback_lines": exec_result.feedback_lines,
+                    }
+                    result_text = self._tool_result_content(payload)
                     visible_text = result_text
                     if len(visible_text) > self.tool_result_max_chars:
                         visible_text = visible_text[: self.tool_result_max_chars] + "... [truncated]"
@@ -415,18 +584,32 @@ class AiRuntime:
                         "name": tc.name,
                         "content": msg_content,
                     }
-                    messages.append(tool_msg)
                     self._append_history(tool_msg)
 
-                    loop = detector.add_call(tc.name, tc.arguments)
+                    if self._is_state_changing_command(exec_result.command):
+                        pending_validation_required = True
+
+                    loop = detector.add_call(
+                        tc.name,
+                        tc.arguments,
+                        validation_required=pending_validation_required,
+                    )
                     if loop:
                         warning = (
                             "DOOM LOOP DETECTED: tool '%s' repeated %d times with identical arguments. "
                             "Try a different approach and do not repeat the same tool call."
                             % (loop["tool_name"], loop["call_count"])
                         )
-                        messages.append({"role": "system", "content": warning})
+                        self._append_history({"role": "system", "content": warning})
                         self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text=warning))
+
+                # If tools executed and validation required but not done, nudge immediately.
+                if self.screenshot_validate_required and pending_validation_required and not validation_done_this_turn:
+                    nudge = (
+                        "Visual validation required now: call capture_viewer_snapshot before final answer."
+                    )
+                    self._append_history({"role": "system", "content": nudge})
+                    self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text=nudge))
 
             self.emit_ui_event(
                 UiEvent(

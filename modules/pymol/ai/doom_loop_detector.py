@@ -8,7 +8,7 @@ import json
 class DoomLoopDetector:
     def __init__(self, threshold: int = 3):
         self.threshold = max(2, int(threshold))
-        self._recent: deque[Tuple[str, str]] = deque(maxlen=self.threshold)
+        self._recent: deque[Tuple[str, str, bool]] = deque(maxlen=self.threshold)
 
     def _normalize_args(self, arguments: Dict[str, Any]) -> str:
         try:
@@ -16,8 +16,16 @@ class DoomLoopDetector:
         except Exception:
             return "{}"
 
-    def add_call(self, tool_name: str, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        sig = (tool_name, self._normalize_args(arguments))
+    def add_call(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        validation_required: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        if tool_name == "capture_viewer_snapshot":
+            return None
+
+        sig = (tool_name, self._normalize_args(arguments), bool(validation_required))
         self._recent.append(sig)
 
         if len(self._recent) < self.threshold:

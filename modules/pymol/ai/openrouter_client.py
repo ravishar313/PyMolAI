@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 from .message_types import ToolCall
 
@@ -36,6 +36,18 @@ def _delta_text(delta) -> str:
         return "".join(chunks)
 
     return ""
+
+
+def build_multimodal_user_content(text: str, image_data_url: Optional[str]) -> List[Dict[str, object]]:
+    parts: List[Dict[str, object]] = [{"type": "text", "text": text}]
+    if image_data_url:
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": image_data_url},
+            }
+        )
+    return parts
 
 
 class OpenRouterClient:
