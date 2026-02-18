@@ -959,11 +959,13 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
 
         feedback = self.cmd._get_feedback()
         if feedback:
-            html = colorprinting.text2html('\n'.join(feedback))
-            self.browser.appendHtml(html)
+            filtered_feedback = self._filter_internal_feedback_lines(feedback)
+            if filtered_feedback:
+                html = colorprinting.text2html('\n'.join(filtered_feedback))
+                self.browser.appendHtml(html)
 
-            scrollbar = self.browser.verticalScrollBar()
-            scrollbar.setValue(scrollbar.maximum())
+                scrollbar = self.browser.verticalScrollBar()
+                scrollbar.setValue(scrollbar.maximum())
 
         if runtime is not None and events:
             scrollbar = self.browser.verticalScrollBar()
@@ -976,6 +978,25 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
                     callback(current_value)
 
         self.feedback_timer.start(500)
+
+    @staticmethod
+    def _filter_internal_feedback_lines(lines):
+        out = []
+        skip_overlay_size_detail = 0
+        for line in lines:
+            text = str(line or "")
+            if skip_overlay_size_detail > 0:
+                if text.startswith("Image:") or text.startswith("Overlay:"):
+                    skip_overlay_size_detail -= 1
+                    continue
+                skip_overlay_size_detail = 0
+
+            if text.startswith("Image and overlay sizes do not match"):
+                skip_overlay_size_detail = 2
+                continue
+
+            out.append(line)
+        return out
 
     def _render_ai_events(self, events):
         role_styles = {

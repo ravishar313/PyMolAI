@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from pymol.ai.message_types import ToolCall, UiRole
+from pymol.ai.message_types import ToolCall, UiEvent, UiRole
 from pymol.ai.runtime import AiRuntime
 from pymol.shortcut import Shortcut
 
@@ -241,8 +241,11 @@ def test_doom_loop_warning_injected(monkeypatch):
 
     runtime._agent_worker("zoom")
 
-    events = _events(runtime)
-    assert any(e.role == UiRole.SYSTEM and "DOOM LOOP DETECTED" in e.text for e in events)
+    _events(runtime)
+    assert any(
+        m.get("role") == "system" and "DOOM LOOP DETECTED" in str(m.get("content", ""))
+        for m in runtime.history
+    )
 
 
 def test_step_limit_has_explicit_error(monkeypatch):
@@ -338,3 +341,16 @@ def test_snapshot_failure_fallback_warning(monkeypatch):
         and e.metadata.get("visual_validation") == "validated: state-only (screenshot failed)"
         for e in events
     )
+
+
+def test_internal_system_reminders_not_visible(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="Visual validation required now: call capture_viewer_snapshot before final answer."))
+    runtime.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="Validation required: capture_viewer_snapshot must be called before final answer because scene-changing commands were executed."))
+    runtime.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="DOOM LOOP DETECTED: tool 'run_pymol_command' repeated 3 times with identical arguments. Try a different approach and do not repeat the same tool call."))
+    runtime.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="AI mode enabled"))
+
+    events = _events(runtime)
+    assert len(events) == 1
+    assert events[0].role == UiRole.SYSTEM
+    assert events[0].text == "AI mode enabled"

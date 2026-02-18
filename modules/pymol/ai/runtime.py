@@ -40,6 +40,11 @@ _READ_ONLY_PREFIXES = (
 )
 
 _RE_PDB_ID = re.compile(r"^[0-9][A-Za-z0-9]{3}$")
+_HIDDEN_SYSTEM_PREFIXES = (
+    "Validation required:",
+    "Visual validation required now:",
+    "DOOM LOOP DETECTED:",
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -95,6 +100,9 @@ class AiRuntime:
         self._ui_mode = mode if mode in ("qt", "text") else "text"
 
     def emit_ui_event(self, event: UiEvent) -> None:
+        if event.role == UiRole.SYSTEM and self._is_internal_system_reminder(event.text):
+            return
+
         with self._event_lock:
             self._ui_events.append(event)
 
@@ -109,6 +117,11 @@ class AiRuntime:
                 UiRole.ERROR: "ERR>",
             }.get(event.role, "AI>")
             print("%s %s" % (prefix, event.text))
+
+    @staticmethod
+    def _is_internal_system_reminder(text: str) -> bool:
+        msg = str(text or "")
+        return any(msg.startswith(prefix) for prefix in _HIDDEN_SYSTEM_PREFIXES)
 
     def drain_ui_events(self) -> List[UiEvent]:
         with self._event_lock:
@@ -482,7 +495,6 @@ class AiRuntime:
                             "because scene-changing commands were executed."
                         )
                         self._append_history({"role": "system", "content": nudge})
-                        self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text=nudge))
                         continue
 
                     # Avoid duplicate final answer if already streamed.
@@ -609,7 +621,6 @@ class AiRuntime:
                         "Visual validation required now: call capture_viewer_snapshot before final answer."
                     )
                     self._append_history({"role": "system", "content": nudge})
-                    self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text=nudge))
 
             self.emit_ui_event(
                 UiEvent(
