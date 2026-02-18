@@ -383,6 +383,14 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
         ext_vis_action.setText('Visible')
         menu.addAction(ext_vis_action)
 
+        ai_menu = self.menudict['Display'].addMenu('AI Assistant')
+        ai_reasoning_action = ai_menu.addAction('Show Reasoning')
+        ai_reasoning_action.setCheckable(True)
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            ai_reasoning_action.setChecked(bool(runtime.reasoning_visible))
+        ai_reasoning_action.toggled.connect(self.set_ai_reasoning_visible)
+
         # extra key mappings (MacPyMOL compatible)
         QtWidgets.QShortcut(QtGui.QKeySequence('Ctrl+O'), self).activated.connect(self.file_open)
         QtWidgets.QShortcut(QtGui.QKeySequence('Ctrl+S'), self).activated.connect(self.session_save)
