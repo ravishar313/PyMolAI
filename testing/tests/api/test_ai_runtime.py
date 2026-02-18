@@ -32,6 +32,14 @@ class FakeClient:
         return self.turns.pop(0)
 
 
+class FakeClientStreaming:
+    def stream_assistant_turn(self, **kwargs):
+        on_text_chunk = kwargs.get("on_text_chunk")
+        if callable(on_text_chunk):
+            on_text_chunk("Done. Ligands are FMN and D59.")
+        return {"assistant_text": "Done. Ligands are FMN and D59.", "tool_calls": []}
+
+
 def _runtime(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.delenv("PYMOL_AI_DISABLE", raising=False)
@@ -103,6 +111,17 @@ def test_agent_no_tool_call_means_final_answer(monkeypatch):
     events = _events(runtime)
     assert any(e.role == UiRole.AI and "Ligands" in e.text for e in events)
     assert runtime.history[-1]["role"] == "assistant"
+
+
+def test_no_duplicate_ai_message_when_streaming_no_tools(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime._client = FakeClientStreaming()
+
+    runtime._agent_worker("what ligands are there")
+    events = _events(runtime)
+    ai_lines = [e.text for e in events if e.role == UiRole.AI]
+    assert ai_lines.count("Done. Ligands are FMN and D59.") == 1
+    assert not any(e.role == UiRole.ERROR for e in events)
 
 
 def test_agent_tool_call_then_final_answer(monkeypatch):

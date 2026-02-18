@@ -55,6 +55,7 @@ class AiRuntime:
         self._ui_mode = "text"
 
         self._stream_line_buffer = ""
+        self._stream_had_output = False
 
         disabled = os.getenv("PYMOL_AI_DISABLE", "").strip() == "1"
         self.enabled = bool(self._api_key) and not disabled
@@ -262,6 +263,8 @@ class AiRuntime:
         ]
 
     def _on_assistant_chunk(self, chunk: str) -> None:
+        if chunk:
+            self._stream_had_output = True
         self._stream_line_buffer += chunk
         while "\n" in self._stream_line_buffer:
             line, self._stream_line_buffer = self._stream_line_buffer.split("\n", 1)
@@ -327,6 +330,7 @@ class AiRuntime:
             self._append_history({"role": "user", "content": prompt})
 
             for step in range(1, self.max_agent_steps + 1):
+                self._stream_had_output = False
                 turn = self._client_or_error().stream_assistant_turn(
                     model=self.model,
                     messages=messages,
@@ -342,8 +346,10 @@ class AiRuntime:
                 tool_calls = list(turn.get("tool_calls") or [])
 
                 if not tool_calls:
+                    # Avoid duplicate final answer if it was already fully streamed.
                     if assistant_text:
-                        self.emit_ui_event(UiEvent(role=UiRole.AI, text=assistant_text))
+                        if not self._stream_had_output:
+                            self.emit_ui_event(UiEvent(role=UiRole.AI, text=assistant_text))
                     elif self.final_answer_enabled:
                         self.emit_ui_event(
                             UiEvent(
