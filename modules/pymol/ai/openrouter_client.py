@@ -65,6 +65,7 @@ class OpenRouterClient:
         tools: Optional[List[Dict[str, object]]],
         on_text_chunk: Callable[[str], None],
         on_reasoning_chunk: Optional[Callable[[str], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, object]:
         try:
             from openai import AsyncOpenAI
@@ -95,6 +96,9 @@ class OpenRouterClient:
         tool_calls_accum: Dict[int, Dict[str, object]] = {}
 
         async for event in stream:
+            if should_cancel and should_cancel():
+                break
+
             choices = getattr(event, "choices", None) or []
             if not choices:
                 continue
@@ -184,6 +188,7 @@ class OpenRouterClient:
         tools: Optional[List[Dict[str, object]]],
         on_text_chunk: Callable[[str], None],
         on_reasoning_chunk: Optional[Callable[[str], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, object]:
         return asyncio.run(
             self._stream_chat_completion(
@@ -192,5 +197,6 @@ class OpenRouterClient:
                 tools=tools,
                 on_text_chunk=on_text_chunk,
                 on_reasoning_chunk=on_reasoning_chunk,
+                should_cancel=should_cancel,
             )
         )

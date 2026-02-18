@@ -10,15 +10,16 @@ import sys
 
 import pymol
 import pymol._gui
-from pymol import colorprinting, save_shortcut
+from pymol import save_shortcut
 
 from pymol.Qt import QtGui, QtCore, QtWidgets
-from pymol.Qt.utils import (getSaveFileNameWithExt, UpdateLock, WidgetMenu,
+from pymol.Qt.utils import (getSaveFileNameWithExt, UpdateLock,
         MainThreadCaller,
         PopupOnException,
-        connectFontContextMenu, getMonospaceFont)
+        )
 
 from .pymol_gl_widget import PyMOLGLWidget
+from .assistant_chat_panel import AssistantChatPanel
 from . import keymapping
 
 from pmg_qt import properties_dialog, file_dialogs
@@ -93,8 +94,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         # resize Window before it is shown
         options = pymol.invocation.options
         self.resize(
-            options.win_x + (220 if options.internal_gui else 0),
-            options.win_y + (246 if options.external_gui else 18))
+            options.win_x + (220 if options.internal_gui else 0) + (340 if options.external_gui else 0),
+            options.win_y + 18)
 
         # for thread-safe viewport command
         self.viewportsignal.connect(self.pymolviewport)
@@ -115,93 +116,27 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             lambda v: self.setWindowTitle("PyMOL (" + os.path.basename(v) + ")")
         )
 
-        # "External" Command Line and Loggin Widget
+        # assistant chat state + command history
         self._setup_history()
-        self.lineedit = CommandLineEdit()
-        self.lineedit.setObjectName("command_line")
-        self.browser = QtWidgets.QPlainTextEdit()
-        self.browser.setObjectName("feedback_browser")
-        self.browser.setReadOnly(True)
+        self.chat_panel = AssistantChatPanel(self)
+        self.chat_panel.sendCommand.connect(self._on_chat_command_submitted)
+        self.chat_panel.clearRequested.connect(self._on_chat_clear_requested)
+        self.chat_panel.stopRequested.connect(self._on_chat_stop_requested)
+        self.lineedit = self.chat_panel.input_edit
 
-        # convenience: clicking into feedback browser gives focus to command
-        # line. Drawback: Copying with CTRL+C doesn't work in feedback
-        # browser -> clear focus proxy while text selected
-        self.browser.setFocusProxy(self.lineedit)
-
-        @self.browser.copyAvailable.connect
-        def _(yes):
-            self.browser.setFocusProxy(None if yes else self.lineedit)
-            self.browser.setFocus()
-
-        # Font
-        self.browser.setFont(getMonospaceFont())
-        connectFontContextMenu(self.browser)
-
-        lineeditlayout = QtWidgets.QHBoxLayout()
-        command_label = QtWidgets.QLabel("PyMOL>")
-        command_label.setObjectName("command_label")
-        lineeditlayout.addWidget(command_label)
-        lineeditlayout.addWidget(self.lineedit)
-        self.lineedit.setToolTip('''Command Input Area
-
-Get the list of commands by hitting <TAB>
-
-Get the list of arguments for one command with a question mark:
-PyMOL> color ?
-
-Read the online help for a command with "help":
-PyMOL> help color
-
-Get autocompletion for many arguments by hitting <TAB>
-PyMOL> color ye<TAB>    (will autocomplete "yellow")
-''')
-
-        layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.browser)
-        layout.addLayout(lineeditlayout)
-
-        quickbuttonslayout = QtWidgets.QVBoxLayout()
-        quickbuttonslayout.setSpacing(2)
-
-        extguilayout = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.LeftToRight)
-        extguilayout.setContentsMargins(2, 2, 2, 2)
-        extguilayout.addLayout(layout)
-        extguilayout.addLayout(quickbuttonslayout)
-
-        class ExtGuiFrame(QtWidgets.QFrame):
-            def mouseDoubleClickEvent(_, event):
-                self.toggle_ext_window_dockable(True)
-
-            _size_hint = QtCore.QSize(options.win_x, options.ext_y)
-
-            def sizeHint(self):
-                return self._size_hint
-
-        dockWidgetContents = ExtGuiFrame(self)
-        dockWidgetContents.setLayout(extguilayout)
-        dockWidgetContents.setObjectName("extgui")
-
-        self.ext_window = \
-            dockWidget = QtWidgets.QDockWidget(self)
-        dockWidget.setWindowTitle("External GUI")
-        dockWidget.setWidget(dockWidgetContents)
+        self.ext_window = dockWidget = QtWidgets.QDockWidget(self)
+        dockWidget.setObjectName("assistant_chat_dock")
+        dockWidget.setWindowTitle("Assistant Chat")
+        dockWidget.setWidget(self.chat_panel)
+        dockWidget.setAllowedAreas(Qt.LeftDockWidgetArea)
+        dockWidget.setFeatures(QtWidgets.QDockWidget.DockWidgetClosable)
+        dockWidget.resize(340, options.win_y)
         if options.external_gui:
-            dockWidget.setTitleBarWidget(QtWidgets.QWidget())
+            dockWidget.show()
         else:
             dockWidget.hide()
 
-        self.addDockWidget(Qt.TopDockWidgetArea, dockWidget)
-
-        # rearrange vertically if docking left or right
-        @dockWidget.dockLocationChanged.connect
-        def _(area):
-            if area == Qt.LeftDockWidgetArea or area == Qt.RightDockWidgetArea:
-                extguilayout.setDirection(QtWidgets.QBoxLayout.BottomToTop)
-                quickbuttonslayout.takeAt(quickbuttons_stretch_index)
-            else:
-                extguilayout.setDirection(QtWidgets.QBoxLayout.LeftToRight)
-                if quickbuttons_stretch_index >= quickbuttonslayout.count():
-                    quickbuttonslayout.addStretch()
+        self.addDockWidget(Qt.LeftDockWidgetArea, dockWidget)
 
         # OpenGL Widget
         self.pymolwidget = PyMOLGLWidget(self)
@@ -215,76 +150,8 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
         self.lineedit.setCompleter(completer)
         '''
 
-        # overload <Tab> action
-        self.lineedit.installEventFilter(self)
+        # overload <Tab> action for viewport controls
         self.pymolwidget.installEventFilter(self)
-
-        # Quick Buttons
-        for row in [
-            [
-                ('Reset', cmd.reset),
-                ('Zoom', lambda: cmd.zoom(animate=1.0)),
-                ('Orient', lambda: cmd.orient(animate=1.0)),
-
-                # render dialog will be constructed when the menu is shown
-                # for the first time. This way it's populated with the current
-                # viewport and settings. Also defers parsing of the ui file.
-                ('Draw/Ray', WidgetMenu(self).setSetupUi(self.render_dialog)),
-            ],
-            [
-                ('Unpick', cmd.unpick),
-                ('Deselect', cmd.deselect),
-                ('Rock', cmd.rock),
-                ('Get View', self.get_view),
-            ],
-            [
-                ('|<', cmd.rewind),
-                ('<', cmd.backward),
-                ('Stop', cmd.mstop),
-                ('Play', cmd.mplay),
-                ('>', cmd.forward),
-                ('>|', cmd.ending),
-                ('MClear', cmd.mclear),
-            ],
-            [
-                ('Builder', self.open_builder_panel),
-                ('Properties', self.open_props_dialog),
-                ('Rebuild', cmd.rebuild),
-            ],
-        ]:
-            hbox = QtWidgets.QHBoxLayout()
-            hbox.setSpacing(2)
-
-            for name, callback in row:
-                btn = QtWidgets.QPushButton(name)
-                btn.setProperty("quickbutton", True)
-                btn.setAttribute(Qt.WA_LayoutUsesWidgetRect) # OS X workaround
-                hbox.addWidget(btn)
-
-                if callback is None:
-                    btn.setEnabled(False)
-                elif isinstance(callback, QtWidgets.QMenu):
-                    btn.setMenu(callback)
-                else:
-                    btn.released.connect(callback)
-
-            quickbuttonslayout.addLayout(hbox)
-
-        # progress bar
-        hbox = QtWidgets.QHBoxLayout()
-        self.progressbar = QtWidgets.QProgressBar()
-        self.progressbar.setSizePolicy(
-                QtWidgets.QSizePolicy.Minimum,
-                QtWidgets.QSizePolicy.Minimum)
-        hbox.addWidget(self.progressbar)
-        self.abortbutton = QtWidgets.QPushButton('Abort')
-        self.abortbutton.setStyleSheet("background: #FF0000; color: #FFFFFF")
-        self.abortbutton.released.connect(cmd.interrupt)
-        hbox.addWidget(self.abortbutton)
-        quickbuttonslayout.addLayout(hbox)
-
-        quickbuttonslayout.addStretch()
-        quickbuttons_stretch_index = quickbuttonslayout.count() - 1
 
         # menu top level
         self.menubar = menubar = self.menuBar()
@@ -373,15 +240,15 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
                             fname if len(fname) < 128 else '...' + fname[-120:],
                             lambda fname=fname: self.load_dialog(fname))
 
-        # some experimental window control
+        # assistant chat controls
         menu = self.menudict['Display'].addSeparator()
-        menu = self.menudict['Display'].addMenu('External GUI')
-        menu.addAction('Toggle dockable', self.toggle_ext_window_dockable).setShortcut(
-            QtGui.QKeySequence('Ctrl+E'))
+        menu = self.menudict['Display'].addMenu('Assistant Chat')
 
         ext_vis_action = self.ext_window.toggleViewAction()
         ext_vis_action.setText('Visible')
         menu.addAction(ext_vis_action)
+        menu.addAction('Focus Input', self.chat_panel.focus_input).setShortcut(
+            QtGui.QKeySequence('Ctrl+E'))
 
         ai_menu = self.menudict['Display'].addMenu('AI Assistant')
         ai_reasoning_action = ai_menu.addAction('Show Reasoning')
@@ -408,7 +275,7 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
 
         # focus in command line
         if options.external_gui:
-            self.lineedit.setFocus()
+            self.chat_panel.focus_input()
         else:
             self.pymolwidget.setFocus()
 
@@ -427,56 +294,26 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
         # Load saved shortcuts on launch
         self.saved_shortcuts = pymol.save_shortcut.load_and_set(self.cmd)
 
-    def lineeditKeyPressEventFilter(self, watched, event):
-        key = event.key()
-        if key == Qt.Key_Tab:
-            self.complete()
-        elif key == Qt.Key_Up:
-            if event.modifiers() & Qt.ControlModifier:
-                self.back_search()
-            else:
-                self.back()
-        elif key == Qt.Key_Down:
-            self.forward()
-        elif key == Qt.Key_Return or key == Qt.Key_Enter:
-            # filter out "Return" instead of binding lineedit.returnPressed,
-            # because otherwise OrthoKey would capture it as well.
-            self.doPrompt()
-        else:
-            return False
-        return True
-
     def eventFilter(self, watched, event):
         '''
         Filter out <Tab> event to do tab-completion instead of move focus
         '''
         type_ = event.type()
-        if type_ == QtCore.QEvent.KeyRelease:
-            if event.key() == Qt.Key_Tab:
-                # silently skip tab release
-                return True
-        elif type_ == QtCore.QEvent.KeyPress:
-            if watched is self.lineedit:
-                return self.lineeditKeyPressEventFilter(watched, event)
-            elif event.key() == Qt.Key_Tab:
+        if watched is self.pymolwidget:
+            if type_ == QtCore.QEvent.KeyRelease:
+                if event.key() == Qt.Key_Tab:
+                    # silently skip tab release
+                    return True
+            elif type_ == QtCore.QEvent.KeyPress and event.key() == Qt.Key_Tab:
                 self.keyPressEvent(event)
                 return True
         return False
 
     def toggle_ext_window_dockable(self, neverfloat=False):
         '''
-        Toggle whether the "external" GUI is dockable
+        Backward compatible command hook: toggle assistant chat visibility
         '''
-        dockWidget = self.ext_window
-
-        if dockWidget.titleBarWidget() is None:
-            tbw = QtWidgets.QWidget()
-        else:
-            tbw = None
-
-        dockWidget.setFloating(tbw is None and not neverfloat)
-        dockWidget.setTitleBarWidget(tbw)
-        dockWidget.show()
+        self.ext_window.setVisible(not self.ext_window.isVisible())
 
     def toggle_fullscreen(self, toggle=-1):
         '''
@@ -929,23 +766,16 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
     #################
 
     def command_get(self):
-        return self.lineedit.text()
+        return self.chat_panel.input_text()
 
     def command_set(self, v):
-        return self.lineedit.setText(v)
+        return self.chat_panel.set_input_text(v)
 
     def command_set_cursor(self, i):
-        return self.lineedit.setCursorPosition(i)
+        return self.chat_panel.set_input_cursor(i)
 
     def update_progress(self):
-        progress = int(self.cmd.get_progress() * 100)
-        if progress >= 0:
-            self.progressbar.setValue(progress)
-            self.progressbar.show()
-            self.abortbutton.show()
-        else:
-            self.progressbar.hide()
-            self.abortbutton.hide()
+        return
 
     def update_feedback(self):
         self.update_progress()
@@ -954,22 +784,16 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
         if runtime is not None:
             events = runtime.drain_ui_events()
             if events:
-                html = self._render_ai_events(events)
-                self.browser.appendHtml(html)
+                self.chat_panel.append_ai_events(events)
+            self.chat_panel.set_mode(runtime.current_input_mode)
+        else:
+            self.chat_panel.set_mode("ai")
 
         feedback = self.cmd._get_feedback()
         if feedback:
             filtered_feedback = self._filter_internal_feedback_lines(feedback)
             if filtered_feedback:
-                html = colorprinting.text2html('\n'.join(filtered_feedback))
-                self.browser.appendHtml(html)
-
-                scrollbar = self.browser.verticalScrollBar()
-                scrollbar.setValue(scrollbar.maximum())
-
-        if runtime is not None and events:
-            scrollbar = self.browser.verticalScrollBar()
-            scrollbar.setValue(scrollbar.maximum())
+                self.chat_panel.append_feedback_block('\n'.join(str(x) for x in filtered_feedback))
 
         for setting in self.cmd.get_setting_updates() or ():
             if setting in self.setting_callbacks:
@@ -998,62 +822,31 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
             out.append(line)
         return out
 
-    def _render_ai_events(self, events):
-        role_styles = {
-            'user': 'color:#1f6feb;font-weight:600;',
-            'ai': 'color:#f0f6fc;',
-            'tool_start': 'color:#e3b341;font-weight:600;',
-            'tool_result_ok': 'color:#3fb950;',
-            'tool_result_err': 'color:#f85149;',
-            'system': 'color:#ffa657;',
-            'reasoning': 'color:#8b949e;font-style:italic;',
-            'error': 'color:#ff7b72;font-weight:600;',
-        }
-        role_prefix = {
-            'user': 'USER',
-            'ai': 'AI',
-            'tool_start': 'TOOL',
-            'tool_result': 'RESULT',
-            'system': 'SYS',
-            'reasoning': 'RZN',
-            'error': 'ERR',
-        }
+    def _on_chat_command_submitted(self, text):
+        self.doTypedCommand(text)
+        self.pymolwidget._pymolProcess()
+        self.feedback_timer.start(0)
 
-        lines = []
-        for event in events:
-            raw_role = getattr(event, 'role', 'ai')
-            role = getattr(raw_role, 'value', raw_role)
-            role = str(role)
-            style_key = role
-            if role == 'tool_result':
-                ok = getattr(event, 'ok', None)
-                style_key = 'tool_result_ok' if ok else 'tool_result_err'
-            style = role_styles.get(style_key, role_styles['ai'])
-            prefix = role_prefix.get(role, 'AI')
-            text = colorprinting.text2html(getattr(event, 'text', ''))
-            metadata = getattr(event, 'metadata', {}) or {}
-            badge = ''
-            vv = metadata.get('visual_validation')
-            if vv:
-                badge = '&nbsp;<span style="color:#8b949e;">(%s)</span>' % (
-                    colorprinting.text2html(str(vv), whitespace=False),
-                )
-            lines.append(
-                '<span style="%s">[%s]&nbsp;</span><span style="%s">%s</span>%s' % (
-                    style,
-                    prefix,
-                    style,
-                    text,
-                    badge,
-                )
-            )
-        return '<br>'.join(lines)
+    def _on_chat_clear_requested(self):
+        self.chat_panel.clear_transcript()
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            runtime.clear_session(emit_notice=False)
+        self.feedback_timer.start(0)
+
+    def _on_chat_stop_requested(self):
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            runtime.request_cancel()
+        self.cmd.interrupt()
+        self.feedback_timer.start(0)
 
     def doPrompt(self):
-        self.doTypedCommand(self.command_get())
-        self.pymolwidget._pymolProcess()
-        self.lineedit.clear()
-        self.feedback_timer.start(0)
+        text = self.command_get().strip()
+        if not text:
+            return
+        self.command_set("")
+        self._on_chat_command_submitted(text)
 
     ##########################
     # legacy plugin system

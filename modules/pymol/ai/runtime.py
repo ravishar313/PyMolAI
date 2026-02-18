@@ -79,6 +79,7 @@ class AiRuntime:
         self._event_lock = threading.Lock()
         self._ui_events: List[UiEvent] = []
         self._ui_mode = "text"
+        self._cancel_event = threading.Event()
 
         self._stream_line_buffer = ""
         self._stream_had_output = False
@@ -98,6 +99,25 @@ class AiRuntime:
 
     def set_ui_mode(self, mode: str) -> None:
         self._ui_mode = mode if mode in ("qt", "text") else "text"
+
+    @property
+    def current_input_mode(self) -> str:
+        return self.input_mode
+
+    def request_cancel(self) -> bool:
+        self._cancel_event.set()
+        with self._lock:
+            busy = bool(self._busy)
+        if busy:
+            self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="cancellation requested..."))
+        return busy
+
+    def clear_session(self, emit_notice: bool = True) -> None:
+        self.history.clear()
+        self._stream_line_buffer = ""
+        self._recent_tool_results.clear()
+        if emit_notice:
+            self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="session memory cleared"))
 
     def emit_ui_event(self, event: UiEvent) -> None:
         if event.role == UiRole.SYSTEM and self._is_internal_system_reminder(event.text):
@@ -243,10 +263,7 @@ class AiRuntime:
             return
 
         if action == "clear":
-            self.history.clear()
-            self._stream_line_buffer = ""
-            self._recent_tool_results.clear()
-            self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="session memory cleared"))
+            self.clear_session(emit_notice=True)
             return
 
         self.emit_ui_event(UiEvent(role=UiRole.ERROR, text="unknown /ai command. Try /ai help"))
@@ -257,6 +274,7 @@ class AiRuntime:
                 self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="request already in progress"))
                 return
             self._busy = True
+            self._cancel_event.clear()
 
         self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="planning..."))
         thread = threading.Thread(
@@ -354,6 +372,8 @@ class AiRuntime:
         ]
 
     def _on_assistant_chunk(self, chunk: str) -> None:
+        if self._cancel_event.is_set():
+            return
         if chunk:
             self._stream_had_output = True
         self._stream_line_buffer += chunk
@@ -456,14 +476,32 @@ class AiRuntime:
 
         snapshot_image_data_url: Optional[str] = None
         snapshot_state_summary: Optional[Dict[str, object]] = None
+        cancelled = False
+
+        def is_cancelled() -> bool:
+            return self._cancel_event.is_set()
+
+        def check_cancel() -> bool:
+            nonlocal cancelled
+            if not is_cancelled():
+                return False
+            if not cancelled:
+                self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="request cancelled"))
+                cancelled = True
+            return True
 
         try:
+            if check_cancel():
+                return
             self._append_history({"role": "user", "content": prompt})
 
             pending_validation_required = False
             validation_done_this_turn = False
 
             for step in range(1, self.max_agent_steps + 1):
+                if check_cancel():
+                    return
+
                 messages = self._build_messages(
                     prompt,
                     snapshot_image_data_url=snapshot_image_data_url,
@@ -482,7 +520,11 @@ class AiRuntime:
                     on_reasoning_chunk=(
                         (lambda t: self.reasoning_visible and self.emit_ui_event(UiEvent(role=UiRole.REASONING, text=t)))
                     ),
+                    should_cancel=is_cancelled,
                 )
+                if check_cancel():
+                    return
+
                 self._flush_assistant_chunks()
 
                 assistant_text = str(turn.get("assistant_text") or "").strip()
@@ -516,6 +558,9 @@ class AiRuntime:
                 validation_done_this_turn = False
 
                 for tc in tool_calls:
+                    if check_cancel():
+                        return
+
                     if tc.name == "capture_viewer_snapshot":
                         self.emit_ui_event(UiEvent(role=UiRole.TOOL_START, text="capture_viewer_snapshot"))
 
@@ -570,6 +615,8 @@ class AiRuntime:
                     self.emit_ui_event(UiEvent(role=UiRole.TOOL_START, text=command))
                     exec_result = self._run_in_gui(lambda c=command: run_pymol_command(self.cmd, c))
                     self._remember_tool_result(exec_result.command, exec_result.ok, exec_result.error)
+                    if check_cancel():
+                        return
 
                     payload = {
                         "ok": exec_result.ok,
@@ -638,6 +685,7 @@ class AiRuntime:
         finally:
             with self._lock:
                 self._busy = False
+            self._cancel_event.clear()
 
 
 def get_ai_runtime(cmd, create: bool = True) -> Optional[AiRuntime]:

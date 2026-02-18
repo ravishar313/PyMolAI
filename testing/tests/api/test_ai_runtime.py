@@ -95,6 +95,33 @@ def test_ai_controls_model_clear_and_mode(monkeypatch):
     assert runtime.history == []
 
 
+def test_clear_session_api(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.history = [{"role": "user", "content": "hello"}]
+    runtime._stream_line_buffer = "partial"
+    runtime._recent_tool_results = [{"command": "zoom", "ok": True, "error": ""}]
+
+    runtime.clear_session(emit_notice=False)
+    assert runtime.history == []
+    assert runtime._stream_line_buffer == ""
+    assert runtime._recent_tool_results == []
+    assert _events(runtime) == []
+
+    runtime.clear_session(emit_notice=True)
+    events = _events(runtime)
+    assert any(e.role == UiRole.SYSTEM and "session memory cleared" in e.text for e in events)
+
+
+def test_cancel_request_stops_worker_cleanly(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.request_cancel()
+
+    runtime._agent_worker("do work")
+    events = _events(runtime)
+    assert any(e.role == UiRole.SYSTEM and "request cancelled" in e.text for e in events)
+    assert not any(e.role == UiRole.ERROR and "unexpected error" in e.text for e in events)
+
+
 def test_missing_api_key_does_not_enable(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     runtime = AiRuntime(DummyCmd())
