@@ -32,20 +32,17 @@ def capture_viewer_snapshot(
         os.close(fd)
         fd = None
 
-        target_width = max(0, int(width or 0))
-        target_height = max(0, int(height or 0))
+        requested_width = max(0, int(width or 0))
+        requested_height = max(0, int(height or 0))
         vpw, vph = _safe_viewport(cmd)
 
-        # Preserve viewport aspect ratio by default to avoid overlay-size mismatch logs.
-        if target_width <= 0:
-            target_width = vpw if vpw > 0 else 1024
-        if target_height <= 0:
-            if vpw > 0 and vph > 0:
-                target_height = max(1, int(round(float(target_width) * float(vph) / float(vpw))))
-            else:
-                target_height = 0
-
-        cmd.png(path, width=target_width, height=target_height, ray=0, quiet=1, prior=0)
+        # Non-invasive capture: never resize the live viewport for AI snapshots.
+        # 1) Try prior framebuffer image (fast path, no redraw/mutation)
+        # 2) Fallback to current viewport render (still width=0,height=0)
+        try:
+            cmd.png(path, width=0, height=0, ray=0, quiet=1, prior=1)
+        except Exception:
+            cmd.png(path, width=0, height=0, ray=0, quiet=1, prior=0)
 
         with open(path, "rb") as handle:
             blob = handle.read()
@@ -56,9 +53,11 @@ def capture_viewer_snapshot(
             "ok": True,
             "image_data_url": data_url,
             "meta": {
-                "width": target_width,
-                "height": target_height,
+                "width": vpw if vpw > 0 else requested_width,
+                "height": vph if vph > 0 else requested_height,
                 "bytes": len(blob),
+                "requested_width": requested_width,
+                "requested_height": requested_height,
             },
         }
     except Exception as exc:  # noqa: BLE001
