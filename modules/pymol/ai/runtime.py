@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 from .claude_sdk_loop import ClaudeSdkLoop
 from .message_types import UiEvent, UiRole
 from .openrouter_client import DEFAULT_MODEL
+from .api_key_store import load_saved_key_into_env_if_needed
 from .state_snapshot import build_viewer_state_snapshot
 from .tool_execution import run_pymol_command
 from .vision_capture import capture_viewer_snapshot
@@ -94,6 +95,8 @@ class AiRuntime:
         self._logger = logging.getLogger("pymol.ai")
         self._log_to_terminal = os.getenv("PYMOL_AI_LOG_STDOUT", "1") != "0"
         self._log_to_python_logger = os.getenv("PYMOL_AI_LOGGER", "0") == "1"
+        key_status = load_saved_key_into_env_if_needed()
+        self._api_key_source = key_status.source
         self.history: List[Dict[str, object]] = []
         self.model = os.getenv("PYMOL_AI_DEFAULT_MODEL") or DEFAULT_MODEL
         self.reasoning_visible = _env_int("PYMOL_AI_REASONING_DEFAULT", 1) == 1
@@ -152,6 +155,7 @@ class AiRuntime:
             debug_mode=self.trace_stream_chunks,
             backend=self._agent_backend,
             api_key_set=bool(self._api_key),
+            api_key_source=self._api_key_source,
             conversation_mode=self.conversation_mode,
             query_session_id=self._chat_query_session_id,
         )

@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+from pymol.ai import runtime as runtime_module
+from pymol.ai.api_key_store import ApiKeyStatus
 from pymol.ai.message_types import UiEvent, UiRole
 from pymol.ai.runtime import AiRuntime
 from pymol.shortcut import Shortcut
@@ -112,6 +114,31 @@ def _events(runtime):
     return runtime.drain_ui_events()
 
 
+def test_runtime_bootstraps_saved_api_key(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("PYMOL_AI_REASONING_DEFAULT", "0")
+    monkeypatch.setenv("PYMOL_AI_CONVERSATION_MODE", "local_first")
+
+    def fake_load():
+        monkeypatch.setenv("OPENROUTER_API_KEY", "saved-key-1234")
+        return ApiKeyStatus(
+            has_key=True,
+            source="saved",
+            masked_key="****1234",
+            keyring_available=True,
+        )
+
+    monkeypatch.setattr(runtime_module, "load_saved_key_into_env_if_needed", fake_load)
+
+    runtime = AiRuntime(DummyCmd())
+    runtime.set_ui_mode("qt")
+
+    assert runtime.enabled is True
+    assert runtime._api_key == "saved-key-1234"
+    assert runtime._api_key_source == "saved"
+
+
 def test_drain_ui_events_limit_preserves_remainder(monkeypatch):
     runtime = _runtime(monkeypatch)
     runtime.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="one"))
@@ -217,15 +244,27 @@ def test_export_import_session_state_roundtrip(monkeypatch):
     assert restored._sdk_session_id == "sess_1"
     assert restored.conversation_mode == "hybrid_resume"
     assert restored._chat_query_session_id == "chat_scope_1"
-
     restored.import_session_state(state, apply_model=True)
     assert restored.model == "openai/test"
     assert restored.reasoning_visible is True
 
 
+def test_runtime_events_and_history_do_not_expose_api_key(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.handle_typed_input("/ai")
+    events = _events(runtime)
+    serialized = repr(events) + repr(runtime.history) + repr(runtime.export_session_state())
+    assert "test-key" not in serialized
+
+
 def test_missing_api_key_does_not_enable(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        runtime_module,
+        "load_saved_key_into_env_if_needed",
+        lambda: ApiKeyStatus(has_key=False, source="none", masked_key="", keyring_available=True),
+    )
     runtime = AiRuntime(DummyCmd())
     runtime.set_ui_mode("qt")
 

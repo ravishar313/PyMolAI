@@ -112,6 +112,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.builder = None
         self.shortcut_menu_filter_dialog = None
         self.scene_panel_dialog = None
+        self.ai_api_key_dialog = None
 
         # setting index -> callable
         self.setting_callbacks = defaultdict(list)
@@ -272,6 +273,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.ai_debug_action = ai_menu.addAction('Debug Mode')
         self.ai_debug_action.setCheckable(True)
 
+        self.ai_api_key_action = ai_menu.addAction('OpenRouter API Key...')
+
         ai_mode_menu = ai_menu.addMenu('Assistant Mode')
         self.ai_mode_action_group = QtWidgets.QActionGroup(self)
         self.ai_mode_action_group.setExclusive(True)
@@ -290,6 +293,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
 
         self.ai_reasoning_action.toggled.connect(self.set_ai_reasoning_visible)
         self.ai_debug_action.toggled.connect(self.set_ai_debug_mode)
+        self.ai_api_key_action.triggered.connect(self._open_ai_api_key_dialog)
         self.ai_mode_work_action.toggled.connect(lambda checked: checked and self.set_ai_agent_mode('work'))
         self.ai_mode_tutor_action.toggled.connect(lambda checked: checked and self.set_ai_agent_mode('tutor'))
 
@@ -859,6 +863,25 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         pymol._gui.PyMOLDesktopGUI.set_ai_agent_mode(self, mode)
         self._persist_runtime_state_now()
         self._sync_ai_settings_menu_from_runtime()
+
+    def _on_ai_api_key_changed(self):
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            runtime.ensure_ai_default_mode(emit_notice=False)
+        self._persist_runtime_state_now()
+        self._sync_ai_settings_menu_from_runtime()
+
+    def _open_ai_api_key_dialog(self):
+        from .ai_api_key_dialog import AiApiKeyDialog
+
+        runtime = self.get_ai_runtime(create=True)
+        model = getattr(runtime, "model", None) if runtime is not None else None
+        self.ai_api_key_dialog = AiApiKeyDialog(
+            self,
+            model=str(model or ""),
+            on_changed=self._on_ai_api_key_changed,
+        )
+        self.ai_api_key_dialog.exec_()
 
     def update_progress(self):
         return
