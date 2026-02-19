@@ -94,6 +94,8 @@ class AiChatStore:
                 "input_mode": "ai",
                 "backend": "claude_sdk",
                 "sdk_session_id": None,
+                "conversation_mode": "local_first",
+                "chat_query_session_id": None,
                 "history": [],
                 "model_info": {},
             },
@@ -336,6 +338,10 @@ class AiChatStore:
         input_mode = "cli" if str(payload.get("input_mode") or "").lower() == "cli" else "ai"
         backend = str(payload.get("backend") or "claude_sdk").strip() or "claude_sdk"
         sdk_session_id = str(payload.get("sdk_session_id") or "").strip() or None
+        conversation_mode = str(payload.get("conversation_mode") or "local_first").strip().lower() or "local_first"
+        if conversation_mode not in ("local_first", "hybrid_resume", "resume_only"):
+            conversation_mode = "local_first"
+        chat_query_session_id = str(payload.get("chat_query_session_id") or "").strip() or None
         history = payload.get("history") or []
         if not isinstance(history, list):
             history = []
@@ -348,6 +354,8 @@ class AiChatStore:
             "input_mode": input_mode,
             "backend": backend,
             "sdk_session_id": sdk_session_id,
+            "conversation_mode": conversation_mode,
+            "chat_query_session_id": chat_query_session_id,
             "history": history,
             "model_info": model_info,
         }

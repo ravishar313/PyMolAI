@@ -100,6 +100,8 @@ class FakeSdkLoop:
 def _runtime(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.delenv("PYMOL_AI_DISABLE", raising=False)
+    monkeypatch.setenv("PYMOL_AI_REASONING_DEFAULT", "0")
+    monkeypatch.setenv("PYMOL_AI_CONVERSATION_MODE", "local_first")
     runtime = AiRuntime(DummyCmd())
     runtime.set_ui_mode("qt")
     return runtime
@@ -162,12 +164,14 @@ def test_clear_session_api(monkeypatch):
     runtime._stream_line_buffer = "partial"
     runtime._recent_tool_results = [{"command": "zoom", "ok": True, "error": ""}]
     runtime._sdk_session_id = "abc"
+    old_query_session_id = runtime._chat_query_session_id
 
     runtime.clear_session(emit_notice=False)
     assert runtime.history == []
     assert runtime._stream_line_buffer == ""
     assert runtime._recent_tool_results == []
     assert runtime._sdk_session_id is None
+    assert runtime._chat_query_session_id != old_query_session_id
     assert _events(runtime) == []
 
     runtime.clear_session(emit_notice=True)
@@ -194,18 +198,24 @@ def test_export_import_session_state_roundtrip(monkeypatch):
     runtime.enabled = True
     runtime.reasoning_visible = True
     runtime._sdk_session_id = "sess_1"
+    runtime.conversation_mode = "hybrid_resume"
+    runtime._chat_query_session_id = "chat_scope_1"
 
     state = runtime.export_session_state()
     assert state["input_mode"] == "cli"
     assert len(state["history"]) == 2
     assert state["backend"] == "claude_sdk"
     assert state["sdk_session_id"] == "sess_1"
+    assert state["conversation_mode"] == "hybrid_resume"
+    assert state["chat_query_session_id"] == "chat_scope_1"
 
     restored = _runtime(monkeypatch)
     restored.import_session_state(state, apply_model=False)
     assert restored.input_mode == "cli"
     assert restored.history == runtime.history
     assert restored._sdk_session_id == "sess_1"
+    assert restored.conversation_mode == "hybrid_resume"
+    assert restored._chat_query_session_id == "chat_scope_1"
 
     restored.import_session_state(state, apply_model=True)
     assert restored.model == "openai/test"
@@ -334,6 +344,7 @@ def test_resume_invalid_retries_with_context_bootstrap(monkeypatch):
     runtime = _runtime(monkeypatch)
     runtime.history = [{"role": "assistant", "content": "previous"}]
     runtime._sdk_session_id = "old_session"
+    runtime.conversation_mode = "hybrid_resume"
     runtime._sdk_loop = FakeSdkLoop(
         [
             {"error": "session expired", "error_class": "resume_invalid"},
@@ -466,6 +477,45 @@ def test_reasoning_hidden_by_default_optional(monkeypatch):
     runtime._agent_worker("y")
     events = _events(runtime)
     assert any(e.role == UiRole.REASONING and "thinking2" in e.text for e in events)
+
+
+def test_local_first_mode_uses_history_and_no_resume(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.history = [
+        {"role": "assistant", "content": "prior answer"},
+        {"role": "tool", "name": "run_pymol_command", "content": '{"ok":true,"command":"zoom"}'},
+    ]
+    runtime._sdk_session_id = "old_session"
+    runtime._sdk_loop = FakeSdkLoop(
+        [{"assistant_text": "ok", "session_id": "sess_local"}]
+    )
+
+    runtime._agent_worker("next")
+
+    assert len(runtime._sdk_loop.calls) == 1
+    call = runtime._sdk_loop.calls[0]
+    assert call["resume_session_id"] is None
+    assert "Conversation context:" in call["prompt"]
+    assert "tool[run_pymol_command]:" in call["prompt"]
+
+
+def test_conversation_mode_matrix(monkeypatch):
+    runtime = _runtime(monkeypatch)
+
+    runtime.conversation_mode = "resume_only"
+    runtime._sdk_session_id = "sess_old"
+    runtime._sdk_loop = FakeSdkLoop([{"assistant_text": "a", "session_id": "s1"}])
+    runtime._agent_worker("one")
+    call = runtime._sdk_loop.calls[-1]
+    assert call["resume_session_id"] == "sess_old"
+    assert "Conversation context:" not in call["prompt"]
+
+    runtime.conversation_mode = "hybrid_resume"
+    runtime._sdk_session_id = "sess_old_2"
+    runtime._sdk_loop = FakeSdkLoop([{"assistant_text": "b", "session_id": "s2"}])
+    runtime._agent_worker("two")
+    call = runtime._sdk_loop.calls[-1]
+    assert call["resume_session_id"] == "sess_old_2"
 
 
 def test_internal_system_reminders_not_visible(monkeypatch):

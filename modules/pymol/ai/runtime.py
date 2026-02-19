@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from typing import Dict, List, Optional, Tuple
 
 from .claude_sdk_loop import ClaudeSdkLoop
@@ -63,6 +64,7 @@ _HIDDEN_SYSTEM_PREFIXES = (
     "Validation required:",
     "Visual validation required now:",
 )
+_CONVERSATION_MODES = ("local_first", "hybrid_resume", "resume_only")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -98,6 +100,11 @@ class AiRuntime:
         self.ui_event_batch = max(1, _env_int("PYMOL_AI_UI_EVENT_BATCH", 40))
         self.ui_max_events = max(0, _env_int("PYMOL_AI_UI_MAX_EVENTS", 2000))
         self.sdk_max_buffer_size = max(0, _env_int("PYMOL_AI_SDK_MAX_BUFFER_SIZE", 10 * 1024 * 1024))
+        self.history_max_messages = max(1, _env_int("PYMOL_AI_HISTORY_MAX_MESSAGES", 80))
+        self.history_max_chars = max(512, _env_int("PYMOL_AI_HISTORY_MAX_CHARS", 12000))
+        self.conversation_mode = self._normalize_conversation_mode(
+            os.getenv("PYMOL_AI_CONVERSATION_MODE") or "local_first"
+        )
         self.trace_stream_chunks = _env_int("PYMOL_AI_TRACE_STREAM", 0) == 1
 
         self.screenshot_width = _env_int("PYMOL_AI_SCREENSHOT_WIDTH", 1024)
@@ -123,6 +130,7 @@ class AiRuntime:
 
         self._agent_backend = "claude_sdk"
         self._sdk_session_id: Optional[str] = None
+        self._chat_query_session_id = self._new_chat_query_session_id()
         self._sdk_loop = ClaudeSdkLoop(logger=self._log_ai)
         self._sdk_loop.set_trace_stream(self.trace_stream_chunks)
         self._sdk_loop.map_openrouter_env()
@@ -137,6 +145,8 @@ class AiRuntime:
             debug_mode=self.trace_stream_chunks,
             backend=self._agent_backend,
             api_key_set=bool(self._api_key),
+            conversation_mode=self.conversation_mode,
+            query_session_id=self._chat_query_session_id,
         )
 
     @property
@@ -146,6 +156,17 @@ class AiRuntime:
     @staticmethod
     def _normalize_agent_mode(mode: str) -> str:
         return "tutor" if str(mode or "").strip().lower() == "tutor" else "work"
+
+    @staticmethod
+    def _normalize_conversation_mode(mode: str) -> str:
+        normalized = str(mode or "").strip().lower()
+        if normalized in _CONVERSATION_MODES:
+            return normalized
+        return "local_first"
+
+    @staticmethod
+    def _new_chat_query_session_id() -> str:
+        return "pymol_chat_%s" % (uuid.uuid4().hex,)
 
     def set_reasoning_visible(self, visible: bool) -> None:
         self.reasoning_visible = bool(visible)
@@ -207,10 +228,24 @@ class AiRuntime:
         self._stream_line_buffer = ""
         self._stream_full_text = ""
         self._recent_tool_results.clear()
-        self._sdk_session_id = None
+        self.reset_remote_session_binding(reason="clear_session")
         self._log_ai("session cleared", emit_notice=emit_notice)
         if emit_notice:
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="session memory cleared"))
+
+    def reset_remote_session_binding(self, reason: str = "") -> None:
+        prev_session_id = self._sdk_session_id
+        prev_query_session_id = self._chat_query_session_id
+        self._sdk_session_id = None
+        self._chat_query_session_id = self._new_chat_query_session_id()
+        self._log_ai(
+            "remote session binding reset",
+            session_reset_reason=reason or "manual",
+            had_session_id=bool(prev_session_id),
+            old_session_id=prev_session_id or "",
+            old_query_session_id=prev_query_session_id,
+            query_session_id=self._chat_query_session_id,
+        )
 
     def ensure_ai_default_mode(self, emit_notice: bool = False) -> bool:
         disabled = os.getenv("PYMOL_AI_DISABLE", "").strip() == "1"
@@ -230,9 +265,11 @@ class AiRuntime:
     def export_session_state(self) -> Dict[str, object]:
         return {
             "input_mode": "cli" if self.input_mode == "cli" else "ai",
-            "history": list(self.history[-80:]),
+            "history": list(self.history[-self.history_max_messages :]),
             "backend": self._agent_backend,
             "sdk_session_id": self._sdk_session_id,
+            "conversation_mode": self.conversation_mode,
+            "chat_query_session_id": self._chat_query_session_id,
             "model_info": {
                 "model": self.model,
                 "enabled": bool(self.enabled),
@@ -253,10 +290,13 @@ class AiRuntime:
         self._agent_backend = str(payload.get("backend") or "claude_sdk")
         session_id = str(payload.get("sdk_session_id") or "").strip()
         self._sdk_session_id = session_id or None
+        self.conversation_mode = self._normalize_conversation_mode(payload.get("conversation_mode") or self.conversation_mode)
+        query_session_id = str(payload.get("chat_query_session_id") or "").strip()
+        self._chat_query_session_id = query_session_id or self._new_chat_query_session_id()
 
         history = payload.get("history") or []
         if isinstance(history, list):
-            self.history = list(history[-80:])
+            self.history = list(history[-self.history_max_messages :])
         else:
             self.history = []
 
@@ -281,6 +321,8 @@ class AiRuntime:
             input_mode=self.input_mode,
             history_len=len(self.history),
             sdk_session_id=bool(self._sdk_session_id),
+            conversation_mode=self.conversation_mode,
+            query_session_id=self._chat_query_session_id,
             reasoning_visible=self.reasoning_visible,
             agent_mode=self.agent_mode,
             debug_mode=self.trace_stream_chunks,
@@ -500,7 +542,13 @@ class AiRuntime:
                 return
             self._busy = True
             self._cancel_event.clear()
-        self._log_ai("starting ai worker", prompt=prompt, resume_session_id=self._sdk_session_id or "")
+        self._log_ai(
+            "starting ai worker",
+            prompt=prompt,
+            resume_session_id=self._sdk_session_id or "",
+            conversation_mode=self.conversation_mode,
+            query_session_id=self._chat_query_session_id,
+        )
 
         thread = threading.Thread(
             target=self._agent_worker,
@@ -512,8 +560,62 @@ class AiRuntime:
 
     def _append_history(self, message: Dict[str, object]) -> None:
         self.history.append(message)
-        if len(self.history) > 80:
-            self.history = self.history[-80:]
+        if len(self.history) > self.history_max_messages:
+            self.history = self.history[-self.history_max_messages :]
+
+    def _format_history_entry(self, message: Dict[str, object]) -> str:
+        role = str(message.get("role") or "").strip()
+        if role in ("user", "assistant", "system"):
+            content = str(message.get("content") or "").strip()
+            if not content:
+                return ""
+            if role == "system" and self._is_internal_system_reminder(content):
+                return ""
+            return "%s: %s" % (role, content)
+
+        if role == "tool":
+            name = str(message.get("name") or "tool").strip() or "tool"
+            content = str(message.get("content") or "").strip()
+            if not content:
+                return ""
+            return "tool[%s]: %s" % (name, content)
+
+        return ""
+
+    def _history_context_lines(self) -> list[str]:
+        if not self.history:
+            return []
+
+        entries = []
+        for message in self.history[-self.history_max_messages :]:
+            line = self._format_history_entry(message)
+            if not line:
+                continue
+            if len(line) > 1200:
+                line = line[:1200] + "... [truncated]"
+            entries.append(line)
+
+        if not entries:
+            return []
+
+        selected_rev = []
+        used = 0
+        for line in reversed(entries):
+            line_len = len(line) + 1
+            if selected_rev and used + line_len > self.history_max_chars:
+                break
+            if not selected_rev and line_len > self.history_max_chars:
+                keep = max(40, self.history_max_chars - 20)
+                line = line[:keep] + "... [truncated]"
+                line_len = len(line) + 1
+            selected_rev.append(line)
+            used += line_len
+
+        selected = list(reversed(selected_rev))
+        omitted = len(entries) - len(selected)
+        if omitted > 0:
+            selected.insert(0, "[%d older context entries omitted]" % (omitted,))
+        return selected
 
     def _state_summary_for_prompt(self) -> Dict[str, object]:
         return self._run_in_gui(
@@ -538,16 +640,11 @@ class AiRuntime:
         ]
 
         if include_history_context:
-            lines.append("")
-            lines.append("Conversation context:")
-            for msg in self.history[-40:]:
-                role = str(msg.get("role") or "").strip()
-                if role not in ("user", "assistant", "system"):
-                    continue
-                content = str(msg.get("content") or "").strip()
-                if not content:
-                    continue
-                lines.append("%s: %s" % (role, content[:500]))
+            context_lines = self._history_context_lines()
+            if context_lines:
+                lines.append("")
+                lines.append("Conversation context:")
+                lines.extend(context_lines)
 
         lines.append("")
         lines.append("User request:")
@@ -937,13 +1034,19 @@ class AiRuntime:
                     }
                 )
 
-            def run_sdk_turn(request_prompt: str, resume_session_id: Optional[str]):
+            def run_sdk_turn(
+                request_prompt: str,
+                resume_session_id: Optional[str],
+                include_history_context: bool,
+                session_reset_reason: str = "",
+            ):
                 return self._sdk_loop.run_turn(
                     prompt=request_prompt,
                     model=self.model,
                     system_prompt=self._build_system_prompt(),
                     max_turns=self.max_agent_steps,
                     resume_session_id=resume_session_id,
+                    query_session_id=self._chat_query_session_id,
                     on_text_chunk=self._on_assistant_chunk,
                     on_message_boundary=self._on_assistant_message_boundary,
                     on_reasoning_chunk=(
@@ -954,47 +1057,77 @@ class AiRuntime:
                     run_command_tool=execute_run_command_tool,
                     snapshot_tool=execute_snapshot_tool,
                     max_buffer_size=self.sdk_max_buffer_size or None,
+                    conversation_mode=self.conversation_mode,
+                    include_history_context=include_history_context,
+                    session_reset_reason=session_reset_reason,
                 )
 
-            turn_prompt = self._build_turn_prompt(prompt, include_history_context=False)
+            include_history_context = self.conversation_mode == "local_first"
+            resume_session_id: Optional[str] = None
+            if self.conversation_mode in ("hybrid_resume", "resume_only"):
+                resume_session_id = self._sdk_session_id
+            if self.conversation_mode == "hybrid_resume" and not resume_session_id:
+                include_history_context = True
+            if self.conversation_mode == "resume_only":
+                include_history_context = False
+
+            turn_prompt = self._build_turn_prompt(prompt, include_history_context=include_history_context)
             self._log_ai(
                 "sdk turn run",
-                include_history_context=False,
-                resume_session_id=self._sdk_session_id or "",
+                include_history_context=include_history_context,
+                resume_session_id=resume_session_id or "",
                 max_turns=self.max_agent_steps,
                 model=self.model,
+                conversation_mode=self.conversation_mode,
+                query_session_id=self._chat_query_session_id,
             )
-            result = run_sdk_turn(turn_prompt, self._sdk_session_id)
+            result = run_sdk_turn(turn_prompt, resume_session_id, include_history_context)
 
-            if (
-                result.error_class == "resume_invalid"
-                and self._sdk_session_id
-                and not check_cancel()
-            ):
-                self._sdk_session_id = None
+            if result.error_class == "resume_invalid" and not check_cancel():
+                self.reset_remote_session_binding(reason="resume_invalid")
                 turn_prompt = self._build_turn_prompt(prompt, include_history_context=True)
-                self._log_ai("sdk resume invalid; retrying with local history context")
-                result = run_sdk_turn(turn_prompt, None)
+                self._log_ai(
+                    "sdk resume invalid; retrying with local history context",
+                    conversation_mode=self.conversation_mode,
+                    query_session_id=self._chat_query_session_id,
+                )
+                result = run_sdk_turn(
+                    turn_prompt,
+                    None,
+                    True,
+                    session_reset_reason="resume_invalid",
+                )
 
             if check_cancel():
                 return
 
             self._flush_assistant_chunks()
-            self._sdk_session_id = result.session_id or self._sdk_session_id
-            self._log_ai(
-                "sdk turn completed",
-                error_class=result.error_class or "",
-                has_error=bool(result.error),
-                session_id=self._sdk_session_id or "",
-            )
 
             if result.error:
                 if result.error_class == "cancelled":
                     check_cancel()
                     return
+                if result.error_class == "resume_invalid":
+                    self.reset_remote_session_binding(reason="resume_invalid_terminal")
+                self._log_ai(
+                    "sdk turn completed",
+                    error_class=result.error_class or "",
+                    has_error=True,
+                    session_id=result.session_id or self._sdk_session_id or "",
+                    query_session_id=self._chat_query_session_id,
+                )
                 self._log_ai("sdk turn failed", level="ERROR", error=result.error, error_class=result.error_class or "")
                 self.emit_ui_event(UiEvent(role=UiRole.ERROR, text=str(result.error)))
                 return
+
+            self._sdk_session_id = result.session_id or self._sdk_session_id
+            self._log_ai(
+                "sdk turn completed",
+                error_class=result.error_class or "",
+                has_error=False,
+                session_id=self._sdk_session_id or "",
+                query_session_id=self._chat_query_session_id,
+            )
 
             if self.screenshot_validate_required and pending_validation_required and not validation_done_this_turn:
                 execute_snapshot_tool("auto_capture_viewer_snapshot_1", {"purpose": "auto_validation"})

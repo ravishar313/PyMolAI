@@ -83,6 +83,8 @@ class PermissionResultDeny:
 
 class FakeClient:
     last_options = None
+    last_query_prompt = None
+    last_query_session_id = None
     messages = None
 
     def __init__(self, options):
@@ -98,6 +100,8 @@ class FakeClient:
     async def query(self, prompt, session_id="default"):
         self.prompt = prompt
         self.session_id = session_id
+        FakeClient.last_query_prompt = prompt
+        FakeClient.last_query_session_id = session_id
 
     async def interrupt(self):
         self.interrupted = True
@@ -228,8 +232,70 @@ def test_run_turn_sets_bypass_permissions_and_allowed_tools(monkeypatch):
     assert opts.can_use_tool is not None
     assert opts.allowed_tools in (None, [])
     assert opts.resume == "sess_old"
-    assert opts.continue_conversation is True
+    assert opts.continue_conversation is False
     assert opts.max_buffer_size == 2097152
+    assert FakeClient.last_query_session_id == "sess_old"
+
+
+def test_run_turn_uses_non_default_query_session_when_not_resuming(monkeypatch):
+    monkeypatch.setattr(sdk_loop_module, "_import_sdk_symbols", _symbols)
+
+    loop = ClaudeSdkLoop()
+    result = loop.run_turn(
+        prompt="test",
+        model="anthropic/claude-sonnet-4",
+        system_prompt="sys",
+        max_turns=8,
+        max_buffer_size=2097152,
+        resume_session_id=None,
+        on_text_chunk=lambda _t: None,
+        on_message_boundary=lambda: None,
+        on_reasoning_chunk=None,
+        on_tool_result=None,
+        should_cancel=lambda: False,
+        run_command_tool=lambda _id, _args: {"ok": True, "command": "zoom"},
+        snapshot_tool=lambda _id, _args: {"ok": True},
+    )
+
+    assert result.error is None
+    assert isinstance(FakeClient.last_query_session_id, str)
+    assert FakeClient.last_query_session_id
+    assert FakeClient.last_query_session_id != "default"
+
+
+def test_run_turn_prefers_explicit_query_session_id(monkeypatch):
+    monkeypatch.setattr(sdk_loop_module, "_import_sdk_symbols", _symbols)
+
+    loop = ClaudeSdkLoop()
+    result = loop.run_turn(
+        prompt="test",
+        model="anthropic/claude-sonnet-4",
+        system_prompt="sys",
+        max_turns=8,
+        max_buffer_size=2097152,
+        resume_session_id=None,
+        query_session_id="chat_scope_123",
+        on_text_chunk=lambda _t: None,
+        on_message_boundary=lambda: None,
+        on_reasoning_chunk=None,
+        on_tool_result=None,
+        should_cancel=lambda: False,
+        run_command_tool=lambda _id, _args: {"ok": True, "command": "zoom"},
+        snapshot_tool=lambda _id, _args: {"ok": True},
+    )
+
+    assert result.error is None
+    assert FakeClient.last_query_session_id == "chat_scope_123"
+
+
+def test_classify_error_marks_invalid_thinking_signature_as_resume_invalid():
+    error = (
+        'API Error: 400 {"error":{"message":"Provider returned error","metadata":{"raw":"'
+        '{"type":"error","error":{"type":"invalid_request_error","message":"messages.99.content.0: '
+        'Invalid `signature` in `thinking` block"}}"}}}'
+    )
+
+    assert sdk_loop_module._classify_error(error) == "resume_invalid"
 
 
 def test_bash_can_use_tool_guard_keeps_cwd_local(monkeypatch):
@@ -368,3 +434,32 @@ def test_snapshot_tool_returns_image_content_shape(monkeypatch):
     assert content[1]["type"] == "image"
     assert content[1]["data"] == "QUJDRA=="
     assert content[1]["mimeType"] == "image/png"
+
+
+def test_run_turn_uses_result_message_text_when_no_assistant_text(monkeypatch):
+    monkeypatch.setattr(sdk_loop_module, "_import_sdk_symbols", _symbols)
+    FakeClient.messages = [
+        AssistantMessage(content=[]),
+        ResultMessage(session_id="sess_new", result="Completed successfully."),
+    ]
+
+    loop = ClaudeSdkLoop()
+    result = loop.run_turn(
+        prompt="test",
+        model="anthropic/claude-sonnet-4",
+        system_prompt="sys",
+        max_turns=4,
+        max_buffer_size=None,
+        resume_session_id=None,
+        on_text_chunk=lambda _t: None,
+        on_message_boundary=lambda: None,
+        on_reasoning_chunk=None,
+        on_tool_result=None,
+        should_cancel=lambda: False,
+        run_command_tool=lambda _id, _args: {"ok": True},
+        snapshot_tool=lambda _id, _args: {"ok": True},
+    )
+
+    assert result.error is None
+    assert result.assistant_text == "Completed successfully."
+    FakeClient.messages = None

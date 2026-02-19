@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -184,6 +185,8 @@ def _classify_error(message: str) -> str:
     low = str(message or "").lower()
     if "resume" in low or "session" in low and ("not found" in low or "invalid" in low or "expired" in low):
         return "resume_invalid"
+    if "signature" in low and "thinking" in low and "invalid" in low:
+        return "resume_invalid"
     if "auth" in low or "api key" in low or "401" in low or "403" in low:
         return "auth_error"
     if "cancel" in low or "interrupt" in low:
@@ -191,6 +194,18 @@ def _classify_error(message: str) -> str:
     if "rate" in low or "429" in low:
         return "rate_limited"
     return "sdk_error"
+
+
+def _resolve_query_session_id(resume_session_id: Optional[str], query_session_id: Optional[str]) -> str:
+    # Avoid reusing a global SDK-local "default" conversation, which can leak
+    # stale prior turns (including signed thinking blocks) into new requests.
+    query_id = str(query_session_id or "").strip()
+    if query_id:
+        return query_id
+    resume_id = str(resume_session_id or "").strip()
+    if resume_id:
+        return resume_id
+    return "pymol_turn_%s" % (uuid.uuid4().hex,)
 
 
 def _decode_data_url_image(data_url: str) -> Tuple[Optional[str], Optional[str]]:
@@ -336,6 +351,10 @@ class ClaudeSdkLoop:
         max_turns: int,
         max_buffer_size: Optional[int],
         resume_session_id: Optional[str],
+        query_session_id: Optional[str] = None,
+        conversation_mode: str = "",
+        include_history_context: Optional[bool] = None,
+        session_reset_reason: str = "",
         on_text_chunk: Callable[[str], None],
         on_message_boundary: Optional[Callable[[], None]],
         on_reasoning_chunk: Optional[Callable[[str], None]],
@@ -410,7 +429,7 @@ class ClaudeSdkLoop:
             max_turns=max(1, int(max_turns)),
             permission_mode="bypassPermissions",
             include_partial_messages=True,
-            continue_conversation=True,
+            continue_conversation=False,
             resume=resume_session_id or None,
             mcp_servers={self.SERVER_NAME: mcp_server},
             env=mapped_env,
@@ -424,7 +443,16 @@ class ClaudeSdkLoop:
             model=model,
             max_turns=max_turns,
             max_buffer_size=max_buffer_size if max_buffer_size else "",
+            continue_conversation=False,
             resume_session_id=resume_session_id or "",
+            query_session_id=query_session_id or "",
+            conversation_mode=conversation_mode or "",
+            include_history_context=(
+                ""
+                if include_history_context is None
+                else bool(include_history_context)
+            ),
+            session_reset_reason=session_reset_reason or "",
         )
 
         interrupted = False
@@ -438,7 +466,8 @@ class ClaudeSdkLoop:
         reported_tool_result_ids = set()
 
         async with ClaudeSDKClient(options=options) as client:
-            await client.query(prompt=prompt, session_id="default")
+            resolved_query_session_id = _resolve_query_session_id(resume_session_id, query_session_id)
+            await client.query(prompt=prompt, session_id=resolved_query_session_id)
 
             async for message in client.receive_response():
                 if should_cancel and should_cancel() and not interrupted:
@@ -638,6 +667,15 @@ class ClaudeSdkLoop:
                     sid = getattr(message, "session_id", None)
                     if sid:
                         session_id = str(sid)
+                    result_text = str(getattr(message, "result", "") or "").strip()
+                    if result_text and not str(final_text or "").strip():
+                        final_text = result_text
+                        if self._trace_stream:
+                            self._log(
+                                "sdk result text fallback applied",
+                                level="DEBUG",
+                                chars=len(result_text),
+                            )
                     if self._trace_stream:
                         self._log(
                             "sdk result message",

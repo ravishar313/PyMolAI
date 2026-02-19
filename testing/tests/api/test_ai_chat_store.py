@@ -129,7 +129,15 @@ def test_runtime_state_is_truncated_and_mode_sanitized(tmp_path):
 
     store.set_runtime_state(
         chat_id,
-        {"input_mode": "CLI", "backend": "claude_sdk", "sdk_session_id": "sess_x", "history": history, "model_info": "bad"},
+        {
+            "input_mode": "CLI",
+            "backend": "claude_sdk",
+            "sdk_session_id": "sess_x",
+            "conversation_mode": "HYBRID_RESUME",
+            "chat_query_session_id": "chat_scope_x",
+            "history": history,
+            "model_info": "bad",
+        },
     )
     store.flush_now()
 
@@ -138,6 +146,8 @@ def test_runtime_state_is_truncated_and_mode_sanitized(tmp_path):
     assert state["input_mode"] == "cli"
     assert state["backend"] == "claude_sdk"
     assert state["sdk_session_id"] == "sess_x"
+    assert state["conversation_mode"] == "hybrid_resume"
+    assert state["chat_query_session_id"] == "chat_scope_x"
     assert len(state["history"]) == 80
     assert isinstance(state["model_info"], dict)
 

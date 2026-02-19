@@ -1079,8 +1079,10 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         runtime = self.get_ai_runtime(create=True)
         if runtime is not None:
             runtime.import_session_state(runtime_state, apply_model=False)
+            runtime.reset_remote_session_binding(reason="history_chat_selected")
             mode = runtime.current_input_mode
             self._sync_ai_settings_menu_from_runtime()
+            self._chat_store.set_runtime_state(chat_id, runtime.export_session_state())
 
         self.chat_panel.replace_transcript(events, mode)
         self._chat_has_user_input = any(str((e or {}).get("role") or "") == "user" for e in events if isinstance(e, dict))
