@@ -23,6 +23,7 @@ class SdkTurnResult:
     error: Optional[str] = None
     error_class: Optional[str] = None
     interrupted: bool = False
+    num_turns: Optional[int] = None
 
 
 def _import_sdk_symbols() -> Dict[str, Any]:
@@ -458,6 +459,7 @@ class ClaudeSdkLoop:
         interrupted = False
         final_text = ""
         session_id = resume_session_id or None
+        num_turns: Optional[int] = None
         in_tool_use_block = False
         active_tool_use_id = ""
         active_tool_use_name = ""
@@ -667,6 +669,12 @@ class ClaudeSdkLoop:
                     sid = getattr(message, "session_id", None)
                     if sid:
                         session_id = str(sid)
+                    turns = getattr(message, "num_turns", None)
+                    try:
+                        if turns is not None:
+                            num_turns = int(turns)
+                    except Exception:
+                        num_turns = None
                     result_text = str(getattr(message, "result", "") or "").strip()
                     if result_text and not str(final_text or "").strip():
                         final_text = result_text
@@ -682,6 +690,7 @@ class ClaudeSdkLoop:
                             level="DEBUG",
                             session_id=session_id or "",
                             is_error=bool(getattr(message, "is_error", False)),
+                            num_turns=num_turns if num_turns is not None else "",
                         )
                     if bool(getattr(message, "is_error", False)):
                         err_text = str(getattr(message, "result", "") or "SDK turn failed")
@@ -692,12 +701,14 @@ class ClaudeSdkLoop:
                             error=err_text,
                             error_class=_classify_error(err_text),
                             interrupted=interrupted,
+                            num_turns=num_turns,
                         )
         self._log(
             "sdk turn finished",
             interrupted=interrupted,
             session_id=session_id or "",
             final_text_chars=len(final_text or ""),
+            num_turns=num_turns if num_turns is not None else "",
         )
 
         return SdkTurnResult(
@@ -706,6 +717,7 @@ class ClaudeSdkLoop:
             error=None,
             error_class=None,
             interrupted=interrupted,
+            num_turns=num_turns,
         )
 
     def run_turn(self, **kwargs) -> SdkTurnResult:

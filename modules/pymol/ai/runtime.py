@@ -94,7 +94,7 @@ class AiRuntime:
         self.input_mode = "ai"
         self.final_answer_enabled = os.getenv("PYMOL_AI_FINAL_ANSWER", "1") != "0"
 
-        self.max_agent_steps = _env_int("PYMOL_AI_MAX_STEPS", 16)
+        self.max_agent_steps = max(1, _env_int("PYMOL_AI_MAX_STEPS", 64))
         self.tool_result_max_chars = _env_int("PYMOL_AI_TOOL_RESULT_MAX_CHARS", 4096)
         self.long_tool_warn_sec = _env_float("PYMOL_AI_LONG_TOOL_WARN_SEC", 8.0)
         self.ui_event_batch = max(1, _env_int("PYMOL_AI_UI_EVENT_BATCH", 40))
@@ -1143,13 +1143,32 @@ class AiRuntime:
                 self._log_ai("assistant final text inferred from streamed chunks", chars=len(streamed_text))
                 self._append_history({"role": "assistant", "content": streamed_text})
             elif self.final_answer_enabled:
-                self._log_ai("missing final assistant answer from sdk", level="ERROR")
-                self.emit_ui_event(
-                    UiEvent(
-                        role=UiRole.ERROR,
-                        text="I completed the loop but did not receive a final answer from the model.",
+                turns_used = result.num_turns if isinstance(result.num_turns, int) else None
+                max_turns_hit = turns_used is not None and turns_used >= self.max_agent_steps
+                if max_turns_hit:
+                    self._log_ai(
+                        "sdk turn reached iteration cap without final answer",
+                        level="WARNING",
+                        num_turns=turns_used,
+                        max_turns=self.max_agent_steps,
                     )
-                )
+                    self.emit_ui_event(
+                        UiEvent(
+                            role=UiRole.SYSTEM,
+                            text=(
+                                "I reached this turn's iteration limit before producing a final answer. "
+                                "Tell me to continue and I will pick up from here."
+                            ),
+                        )
+                    )
+                else:
+                    self._log_ai("missing final assistant answer from sdk", level="ERROR")
+                    self.emit_ui_event(
+                        UiEvent(
+                            role=UiRole.ERROR,
+                            text="I completed the loop but did not receive a final answer from the model.",
+                        )
+                    )
         except Exception as exc:  # noqa: BLE001
             self._log_ai("unexpected runtime exception", level="ERROR", error=exc)
             self.emit_ui_event(UiEvent(role=UiRole.ERROR, text="unexpected error: %s" % (exc,)))

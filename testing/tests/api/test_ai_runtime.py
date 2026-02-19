@@ -94,6 +94,7 @@ class FakeSdkLoop:
             error=plan.get("error"),
             error_class=plan.get("error_class"),
             interrupted=plan.get("interrupted", False),
+            num_turns=plan.get("num_turns"),
         )
 
 
@@ -316,6 +317,32 @@ def test_stream_only_output_does_not_emit_missing_final_error(monkeypatch):
     assert "Loaded 5del successfully." in str(runtime.history[-1]["content"])
 
 
+def test_iteration_cap_emits_continue_prompt(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.screenshot_validate_required = False
+    runtime._sdk_loop = FakeSdkLoop(
+        [
+            {
+                "assistant_text": "",
+                "session_id": "sess_iter_cap",
+                "num_turns": runtime.max_agent_steps,
+            }
+        ]
+    )
+
+    runtime._agent_worker("run full workflow")
+
+    events = _events(runtime)
+    assert any(
+        e.role == UiRole.SYSTEM and "Tell me to continue" in str(e.text or "")
+        for e in events
+    )
+    assert not any(
+        e.role == UiRole.ERROR and "did not receive a final answer" in str(e.text or "")
+        for e in events
+    )
+
+
 def test_stream_chunks_emit_progress_without_newline(monkeypatch):
     runtime = _runtime(monkeypatch)
     runtime._on_assistant_chunk("12345")
@@ -477,6 +504,11 @@ def test_reasoning_hidden_by_default_optional(monkeypatch):
     runtime._agent_worker("y")
     events = _events(runtime)
     assert any(e.role == UiRole.REASONING and "thinking2" in e.text for e in events)
+
+
+def test_default_max_agent_steps_is_high(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    assert runtime.max_agent_steps == 64
 
 
 def test_local_first_mode_uses_history_and_no_resume(monkeypatch):
