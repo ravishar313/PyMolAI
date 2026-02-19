@@ -291,9 +291,11 @@ class AssistantChatPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._active_ai_bubble = None
+        self._active_reasoning_bubble = None
         self._pending_tool_start = ""
         self._last_ai_text = ""
         self._pending_ai_text = ""
+        self._pending_reasoning_text = ""
         self._mode = "ai"
         self._max_visible_cards = self.MAX_VISIBLE_CARDS
 
@@ -413,9 +415,11 @@ class AssistantChatPanel(QtWidgets.QWidget):
     def clear_transcript(self):
         self._ai_flush_timer.stop()
         self._active_ai_bubble = None
+        self._active_reasoning_bubble = None
         self._pending_tool_start = ""
         self._last_ai_text = ""
         self._pending_ai_text = ""
+        self._pending_reasoning_text = ""
         while self.feed_layout.count() > 1:
             item = self.feed_layout.takeAt(0)
             widget = item.widget()
@@ -450,6 +454,7 @@ class AssistantChatPanel(QtWidgets.QWidget):
         if not text:
             return
         self._active_ai_bubble = None
+        self._active_reasoning_bubble = None
         bubble = MessageBubble("PyMOL", kind="system", markdown=False, monospace=True)
         bubble.set_text(text)
         self._append_widget(bubble)
@@ -463,13 +468,22 @@ class AssistantChatPanel(QtWidgets.QWidget):
             metadata = dict(getattr(event, "metadata", None) or {})
 
             if role == "ai":
+                if metadata.get("stream_boundary"):
+                    self._flush_pending_ai_text()
+                    self._active_ai_bubble = None
+                    continue
                 self._append_ai_text(text, is_stream_chunk=bool(metadata.get("stream_chunk")))
+                continue
+
+            if role == "reasoning":
+                self._append_reasoning_text(text, is_stream_chunk=bool(metadata.get("stream_chunk", True)))
                 continue
 
             self._flush_pending_ai_text()
 
             if role == "user":
                 self._active_ai_bubble = None
+                self._active_reasoning_bubble = None
                 self._last_ai_text = ""
                 bubble = MessageBubble("You", kind="user", markdown=False)
                 bubble.set_text(text)
@@ -478,11 +492,13 @@ class AssistantChatPanel(QtWidgets.QWidget):
                 # End any active assistant bubble before upcoming tool output so
                 # assistant text before/after tools is rendered as separate blocks.
                 self._active_ai_bubble = None
+                self._active_reasoning_bubble = None
                 self._pending_tool_start = text
             elif role == "tool_result":
                 # Tool execution marks a boundary in the assistant response.
                 # Keep pre-tool and post-tool assistant text in separate bubbles.
                 self._active_ai_bubble = None
+                self._active_reasoning_bubble = None
                 if self._pending_tool_start:
                     metadata.setdefault("tool_command", self._pending_tool_start)
                 self._append_widget(
@@ -494,12 +510,9 @@ class AssistantChatPanel(QtWidgets.QWidget):
                     )
                 )
                 self._pending_tool_start = ""
-            elif role == "reasoning":
-                bubble = MessageBubble("Reasoning", kind="reasoning", markdown=False)
-                bubble.set_text(text)
-                self._append_widget(bubble)
             elif role == "error":
                 self._active_ai_bubble = None
+                self._active_reasoning_bubble = None
                 bubble = MessageBubble("Error", kind="error", markdown=False)
                 bubble.set_text(text)
                 self._append_widget(bubble)
@@ -507,6 +520,7 @@ class AssistantChatPanel(QtWidgets.QWidget):
                 if text.strip().lower() == "planning...":
                     continue
                 self._active_ai_bubble = None
+                self._active_reasoning_bubble = None
                 bubble = MessageBubble("System", kind="system", markdown=False)
                 bubble.set_text(text)
                 self._append_widget(bubble)
@@ -531,18 +545,40 @@ class AssistantChatPanel(QtWidgets.QWidget):
         if not self._ai_flush_timer.isActive():
             self._ai_flush_timer.start()
 
+    def _append_reasoning_text(self, text: str, *, is_stream_chunk: bool = True):
+        chunk = str(text or "")
+        if not chunk:
+            return
+        if not self._active_reasoning_bubble:
+            self._active_reasoning_bubble = MessageBubble("Reasoning", kind="reasoning", markdown=False)
+            self._append_widget(self._active_reasoning_bubble)
+        if is_stream_chunk:
+            self._pending_reasoning_text += chunk
+        else:
+            clean = chunk.strip()
+            if not clean:
+                return
+            if self._pending_reasoning_text:
+                self._pending_reasoning_text += "\n"
+            self._pending_reasoning_text += clean
+        if not self._ai_flush_timer.isActive():
+            self._ai_flush_timer.start()
+
     def _flush_pending_ai_text(self):
-        if not self._pending_ai_text:
+        if not self._pending_ai_text and not self._pending_reasoning_text:
             return
-        if not self._active_ai_bubble:
+        if self._pending_ai_text:
+            if self._active_ai_bubble:
+                chunk = self._pending_ai_text
+                self._active_ai_bubble.append_chunk(chunk)
+                lines = self._active_ai_bubble._raw_text.splitlines()
+                if lines:
+                    self._last_ai_text = lines[-1].strip()
             self._pending_ai_text = ""
-            return
-        chunk = self._pending_ai_text
-        self._pending_ai_text = ""
-        self._active_ai_bubble.append_chunk(chunk)
-        lines = self._active_ai_bubble._raw_text.splitlines()
-        if lines:
-            self._last_ai_text = lines[-1].strip()
+        if self._pending_reasoning_text:
+            if self._active_reasoning_bubble:
+                self._active_reasoning_bubble.append_chunk(self._pending_reasoning_text)
+            self._pending_reasoning_text = ""
         self._scroll_to_bottom()
 
     def _append_widget(self, widget: QtWidgets.QWidget):
@@ -558,6 +594,8 @@ class AssistantChatPanel(QtWidgets.QWidget):
             widget = item.widget()
             if widget is self._active_ai_bubble:
                 self._active_ai_bubble = None
+            if widget is self._active_reasoning_bubble:
+                self._active_reasoning_bubble = None
             if widget is not None:
                 widget.deleteLater()
 

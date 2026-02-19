@@ -32,9 +32,32 @@ class FakeTextBlock:
         self.text = text
 
 
+class FakeToolUseBlock:
+    def __init__(self, tool_id, name, tool_input):
+        self.type = "tool_use"
+        self.id = tool_id
+        self.name = name
+        self.input = tool_input
+
+
+class FakeToolResultBlock:
+    def __init__(self, tool_use_id, content, is_error=False):
+        self.type = "tool_result"
+        self.tool_use_id = tool_use_id
+        self.content = content
+        self.is_error = is_error
+
+
 class AssistantMessage:
-    def __init__(self, text):
-        self.content = [FakeTextBlock(text)]
+    def __init__(self, text="", content=None):
+        self.content = list(content) if content is not None else [FakeTextBlock(text)]
+
+
+class UserMessage:
+    def __init__(self, *, parent_tool_use_id=None, tool_use_result=None, content=None):
+        self.parent_tool_use_id = parent_tool_use_id
+        self.tool_use_result = tool_use_result
+        self.content = list(content or [])
 
 
 class ResultMessage:
@@ -44,8 +67,23 @@ class ResultMessage:
         self.result = result
 
 
+@dataclass
+class PermissionResultAllow:
+    behavior: str = "allow"
+    updated_input: dict | None = None
+    updated_permissions: list | None = None
+
+
+@dataclass
+class PermissionResultDeny:
+    behavior: str = "deny"
+    message: str = ""
+    interrupt: bool = False
+
+
 class FakeClient:
     last_options = None
+    messages = None
 
     def __init__(self, options):
         self.options = options
@@ -65,6 +103,10 @@ class FakeClient:
         self.interrupted = True
 
     async def receive_response(self):
+        if self.messages is not None:
+            for item in self.messages:
+                yield item
+            return
         yield StreamEvent(text="Hello ")
         yield AssistantMessage("Hello world")
         yield ResultMessage(session_id="sess_new")
@@ -80,10 +122,11 @@ class FakeOptions:
     continue_conversation: bool
     resume: str
     mcp_servers: dict
-    allowed_tools: list
     env: dict
     cwd: str
+    allowed_tools: list | None = None
     max_buffer_size: int | None = None
+    can_use_tool: object | None = None
 
 
 @dataclass
@@ -102,8 +145,12 @@ def _symbols():
 
         return decorator
 
+    class _Module:
+        PermissionResultAllow = PermissionResultAllow
+        PermissionResultDeny = PermissionResultDeny
+
     return {
-        "module": object(),
+        "module": _Module(),
         "ClaudeCodeOptions": FakeOptions,
         "ClaudeSDKClient": FakeClient,
         "create_sdk_mcp_server": create_sdk_mcp_server,
@@ -155,7 +202,9 @@ def test_run_turn_sets_bypass_permissions_and_allowed_tools(monkeypatch):
         max_buffer_size=2097152,
         resume_session_id="sess_old",
         on_text_chunk=lambda _t: None,
+        on_message_boundary=lambda: None,
         on_reasoning_chunk=None,
+        on_tool_result=None,
         should_cancel=lambda: False,
         run_command_tool=lambda _id, _args: {"ok": True, "command": "zoom"},
         snapshot_tool=lambda _id, _args: {"ok": True},
@@ -166,13 +215,127 @@ def test_run_turn_sets_bypass_permissions_and_allowed_tools(monkeypatch):
 
     opts = FakeClient.last_options
     assert opts.permission_mode == "bypassPermissions"
-    assert set(opts.allowed_tools) == {
-        "run_pymol_command",
-        "capture_viewer_snapshot",
-    }
+    assert opts.can_use_tool is not None
+    assert opts.allowed_tools in (None, [])
     assert opts.resume == "sess_old"
     assert opts.continue_conversation is True
     assert opts.max_buffer_size == 2097152
+
+
+def test_bash_can_use_tool_guard_keeps_cwd_local(monkeypatch):
+    monkeypatch.setattr(sdk_loop_module, "_import_sdk_symbols", _symbols)
+    loop = ClaudeSdkLoop()
+    loop.run_turn(
+        prompt="test",
+        model="anthropic/claude-sonnet-4",
+        system_prompt="sys",
+        max_turns=4,
+        max_buffer_size=None,
+        resume_session_id=None,
+        on_text_chunk=lambda _t: None,
+        on_message_boundary=lambda: None,
+        on_reasoning_chunk=None,
+        on_tool_result=None,
+        should_cancel=lambda: False,
+        run_command_tool=lambda _id, _args: {"ok": True, "command": "zoom"},
+        snapshot_tool=lambda _id, _args: {"ok": True},
+    )
+    opts = FakeClient.last_options
+    guard = opts.can_use_tool
+    assert guard is not None
+
+    allowed = asyncio.run(guard("Bash", {"command": "pwd"}, None))
+    assert allowed.behavior == "allow"
+    assert allowed.updated_input["cwd"] == opts.cwd
+
+    denied = asyncio.run(guard("Bash", {"command": "cd /tmp && pwd"}, None))
+    assert denied.behavior == "deny"
+
+
+def test_run_turn_emits_external_tool_results_from_assistant_blocks(monkeypatch):
+    monkeypatch.setattr(sdk_loop_module, "_import_sdk_symbols", _symbols)
+    FakeClient.messages = [
+        AssistantMessage(
+            content=[
+                FakeToolUseBlock("toolu_1", "Bash", {"command": "which ffmpeg"}),
+                FakeToolResultBlock("toolu_1", [{"type": "text", "text": "/opt/homebrew/bin/ffmpeg"}], False),
+            ]
+        ),
+        ResultMessage(session_id="sess_new"),
+    ]
+    emitted = []
+
+    loop = ClaudeSdkLoop()
+    result = loop.run_turn(
+        prompt="test",
+        model="anthropic/claude-sonnet-4",
+        system_prompt="sys",
+        max_turns=4,
+        max_buffer_size=None,
+        resume_session_id=None,
+        on_text_chunk=lambda _t: None,
+        on_message_boundary=lambda: None,
+        on_reasoning_chunk=None,
+        on_tool_result=lambda tool_id, name, args, output, is_error: emitted.append(
+            (tool_id, name, args, output, is_error)
+        ),
+        should_cancel=lambda: False,
+        run_command_tool=lambda _id, _args: {"ok": True},
+        snapshot_tool=lambda _id, _args: {"ok": True},
+    )
+
+    assert result.error is None
+    assert emitted
+    tool_id, name, args, output, is_error = emitted[0]
+    assert tool_id == "toolu_1"
+    assert name == "Bash"
+    assert args.get("command") == "which ffmpeg"
+    assert "ffmpeg" in str(output)
+    assert is_error is False
+    FakeClient.messages = None
+
+
+def test_run_turn_emits_external_tool_results_from_user_message(monkeypatch):
+    monkeypatch.setattr(sdk_loop_module, "_import_sdk_symbols", _symbols)
+    FakeClient.messages = [
+        AssistantMessage(content=[FakeToolUseBlock("toolu_1", "Bash", {"command": "which ffmpeg"})]),
+        UserMessage(
+            parent_tool_use_id="toolu_1",
+            tool_use_result={"stdout": "/opt/homebrew/bin/ffmpeg", "exit_code": 0},
+            content=[],
+        ),
+        ResultMessage(session_id="sess_new"),
+    ]
+    emitted = []
+
+    loop = ClaudeSdkLoop()
+    result = loop.run_turn(
+        prompt="test",
+        model="anthropic/claude-sonnet-4",
+        system_prompt="sys",
+        max_turns=4,
+        max_buffer_size=None,
+        resume_session_id=None,
+        on_text_chunk=lambda _t: None,
+        on_message_boundary=lambda: None,
+        on_reasoning_chunk=None,
+        on_tool_result=lambda tool_id, name, args, output, is_error: emitted.append(
+            (tool_id, name, args, output, is_error)
+        ),
+        should_cancel=lambda: False,
+        run_command_tool=lambda _id, _args: {"ok": True},
+        snapshot_tool=lambda _id, _args: {"ok": True},
+    )
+
+    assert result.error is None
+    assert emitted
+    tool_id, name, args, output, is_error = emitted[0]
+    assert tool_id == "toolu_1"
+    assert name == "Bash"
+    assert args.get("command") == "which ffmpeg"
+    assert "ffmpeg" in str(output)
+    assert is_error is False
+    FakeClient.messages = None
 
 
 def test_snapshot_tool_returns_image_content_shape(monkeypatch):

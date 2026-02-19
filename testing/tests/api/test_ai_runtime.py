@@ -71,6 +71,16 @@ class FakeSdkLoop:
                 kwargs["run_command_tool"](action.get("id", "call_run"), action.get("args", {}))
             elif action["kind"] == "tool_snapshot":
                 kwargs["snapshot_tool"](action.get("id", "call_snapshot"), action.get("args", {}))
+            elif action["kind"] == "external_tool_result":
+                cb = kwargs.get("on_tool_result")
+                if cb:
+                    cb(
+                        action.get("id", "external_call"),
+                        action.get("tool_name", ""),
+                        action.get("args", {}),
+                        action.get("result"),
+                        action.get("is_error"),
+                    )
             elif action["kind"] == "stream":
                 kwargs["on_text_chunk"](action.get("text", ""))
             elif action["kind"] == "reason":
@@ -392,6 +402,40 @@ def test_snapshot_failure_fallback_warning(monkeypatch):
         and e.metadata.get("visual_validation") == "validated: state-only (screenshot failed)"
         for e in events
     )
+
+
+def test_external_bash_tool_result_is_visible(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.screenshot_validate_required = False
+    runtime._sdk_loop = FakeSdkLoop(
+        [
+            {
+                "actions": [
+                    {
+                        "kind": "external_tool_result",
+                        "id": "tool_bash_1",
+                        "tool_name": "Bash",
+                        "args": {"command": "which ffmpeg"},
+                        "result": {"stdout": "/opt/homebrew/bin/ffmpeg", "exit_code": 0},
+                        "is_error": False,
+                    }
+                ],
+                "assistant_text": "ffmpeg is installed",
+                "session_id": "sess_shell",
+            }
+        ]
+    )
+
+    runtime._agent_worker("check ffmpeg")
+    events = _events(runtime)
+    tool_events = [e for e in events if e.role == UiRole.TOOL_RESULT]
+    assert tool_events
+    evt = tool_events[0]
+    assert evt.ok is True
+    assert evt.metadata.get("tool_name") == "Bash"
+    assert evt.metadata.get("tool_command") == "which ffmpeg"
+    result_json = evt.metadata.get("tool_result_json")
+    assert "ffmpeg" in str(result_json)
 
 
 def test_cancel_request_stops_worker_cleanly(monkeypatch):

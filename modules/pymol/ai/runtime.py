@@ -23,13 +23,16 @@ You can either:
 Rules:
 - Use tool calls when an action/query in PyMOL is needed.
 - If tool results already answer the user, return a concise final answer and DO NOT call tools.
-- Do not use shell commands.
+- If you use terminal commands, run them only when required and only to support the user's request.
+- Always report terminal actions factually from tool output; do not claim actions that were not actually executed.
+- If external dependencies (like ffmpeg) are missing, state that limitation plainly and ask the user to install them.
 - Prefer continuing current session state; avoid redundant fetch/load.
 - capture_viewer_snapshot is INTERNAL validation only. The user cannot see this image in chat.
 - Never say you are taking a screenshot "to show" the user.
 - If you use capture_viewer_snapshot, describe it as internal validation of viewer state.
 - After state-changing commands, use capture_viewer_snapshot to verify the scene actually reflects the requested outcome.
 - Do not claim completion until scene validation has been performed (or explicitly explain why validation failed).
+- During long chains of scene changes, you may call capture_viewer_snapshot intermittently to checkpoint progress and prevent downstream mistakes.
 - Do not repeat the same setup sentence or intent text step after step.
 - If a strategy fails repeatedly, switch approach or ask the user for clarification.
 - Do not re-run the same successful command in the same request unless you clearly explain why.
@@ -518,6 +521,13 @@ class AiRuntime:
             )
         self.emit_ui_event(UiEvent(role=UiRole.AI, text=piece, metadata={"stream_chunk": True}))
 
+    def _on_assistant_message_boundary(self) -> None:
+        if self._cancel_event.is_set():
+            return
+        if self.trace_stream_chunks:
+            self._log_ai("stream message boundary", level="DEBUG")
+        self.emit_ui_event(UiEvent(role=UiRole.AI, text="", metadata={"stream_boundary": True}))
+
     def _flush_assistant_chunks(self) -> None:
         if self._stream_line_buffer.strip():
             self.emit_ui_event(UiEvent(role=UiRole.AI, text=self._stream_line_buffer.strip()))
@@ -791,6 +801,67 @@ class AiRuntime:
                     "image_data_url": image_data_url,
                 }
 
+            def execute_external_tool_result(
+                tool_call_id: str,
+                tool_name: str,
+                tool_args: Dict[str, object],
+                tool_output: object,
+                tool_error_flag: Optional[bool],
+            ) -> None:
+                normalized = str(tool_name or "").strip()
+                if normalized in ("run_pymol_command", "capture_viewer_snapshot"):
+                    return
+
+                args_payload = dict(tool_args or {})
+                command = ""
+                if normalized == "Bash":
+                    command = str(args_payload.get("command") or "").strip()
+                if not command:
+                    command = normalized or "tool"
+
+                ok = not bool(tool_error_flag)
+                payload = {
+                    "ok": ok,
+                    "tool_name": normalized or "tool",
+                    "tool_args": args_payload,
+                    "result": tool_output,
+                    "is_error": bool(tool_error_flag),
+                }
+
+                self._log_ai(
+                    "external tool result",
+                    tool_call_id=tool_call_id,
+                    tool_name=normalized or "tool",
+                    command=command,
+                    ok=ok,
+                )
+                self.emit_ui_event(
+                    UiEvent(
+                        role=UiRole.TOOL_RESULT,
+                        text="Executed: %s" % (command,),
+                        ok=ok,
+                        metadata={
+                            "tool_call_id": tool_call_id or "external_tool",
+                            "tool_name": normalized or "tool",
+                            "tool_args": args_payload,
+                            "tool_command": command if normalized == "Bash" else None,
+                            "tool_result_json": self._tool_result_metadata_payload(payload),
+                        },
+                    )
+                )
+
+                content = self._tool_result_content(payload)
+                if len(content) > self.tool_result_max_chars:
+                    content = content[: self.tool_result_max_chars] + "... [truncated]"
+                self._append_history(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id or "external_tool",
+                        "name": normalized or "tool",
+                        "content": content,
+                    }
+                )
+
             def run_sdk_turn(request_prompt: str, resume_session_id: Optional[str]):
                 return self._sdk_loop.run_turn(
                     prompt=request_prompt,
@@ -799,9 +870,11 @@ class AiRuntime:
                     max_turns=self.max_agent_steps,
                     resume_session_id=resume_session_id,
                     on_text_chunk=self._on_assistant_chunk,
+                    on_message_boundary=self._on_assistant_message_boundary,
                     on_reasoning_chunk=(
                         (lambda t: self.reasoning_visible and self.emit_ui_event(UiEvent(role=UiRole.REASONING, text=t)))
                     ),
+                    on_tool_result=execute_external_tool_result,
                     should_cancel=is_cancelled,
                     run_command_tool=execute_run_command_tool,
                     snapshot_tool=execute_snapshot_tool,

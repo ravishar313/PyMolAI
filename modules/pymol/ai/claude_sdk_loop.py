@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -120,6 +121,63 @@ def _extract_assistant_text(message: Any) -> Tuple[str, str]:
                 reasoning_parts.append(r)
 
     return "".join(text_parts), "\n".join(reasoning_parts)
+
+
+def _assistant_block_type(block: Any) -> str:
+    data = _to_mapping(block)
+    block_type = str(data.get("type") or "")
+    if block_type:
+        return block_type
+    name = type(block).__name__
+    if name == "TextBlock":
+        return "text"
+    if name == "ThinkingBlock":
+        return "thinking"
+    if name == "ToolUseBlock":
+        return "tool_use"
+    if name == "ToolResultBlock":
+        return "tool_result"
+    return ""
+
+
+def _as_json_dict(text: str) -> Dict[str, Any]:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {}
+
+
+def _safe_realpath(base: str, value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return os.path.realpath(base)
+    if os.path.isabs(text):
+        return os.path.realpath(text)
+    return os.path.realpath(os.path.join(base, text))
+
+
+def _is_within_root(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([os.path.realpath(path), os.path.realpath(root)]) == os.path.realpath(root)
+    except Exception:
+        return False
+
+
+def _extract_cd_targets(command: str) -> list[str]:
+    # Best-effort scan for "cd <path>" across shell command chains.
+    pattern = re.compile(r"(?:^|&&|\|\||;)\s*cd\s+([^;&|]+)")
+    targets = []
+    for match in pattern.finditer(str(command or "")):
+        target = match.group(1).strip().strip("\"'`")
+        if target:
+            targets.append(target)
+    return targets
 
 
 def _classify_error(message: str) -> str:
@@ -276,7 +334,9 @@ class ClaudeSdkLoop:
         max_buffer_size: Optional[int],
         resume_session_id: Optional[str],
         on_text_chunk: Callable[[str], None],
+        on_message_boundary: Optional[Callable[[], None]],
         on_reasoning_chunk: Optional[Callable[[str], None]],
+        on_tool_result: Optional[Callable[[str, str, Dict[str, Any], Any, Optional[bool]], None]],
         should_cancel: Optional[Callable[[], bool]],
         run_command_tool: Callable[[str, Dict[str, Any]], Dict[str, Any]],
         snapshot_tool: Callable[[str, Dict[str, Any]], Dict[str, Any]],
@@ -286,6 +346,8 @@ class ClaudeSdkLoop:
         ClaudeSDKClient = symbols["ClaudeSDKClient"]
         create_sdk_mcp_server = symbols["create_sdk_mcp_server"]
         tool = symbols["tool"]
+        PermissionResultAllow = getattr(symbols["module"], "PermissionResultAllow")
+        PermissionResultDeny = getattr(symbols["module"], "PermissionResultDeny")
         sdk_package = symbols.get("sdk_package", "unknown")
 
         mapped_env = self.map_openrouter_env()
@@ -296,6 +358,49 @@ class ClaudeSdkLoop:
             snapshot_tool=snapshot_tool,
         )
 
+        working_dir = os.path.realpath(os.getcwd())
+
+        async def can_use_tool(tool_name: str, tool_input: Dict[str, Any], _context) -> Any:
+            # Allow everything by default; only apply cwd guard for Bash.
+            if str(tool_name or "").strip().lower() != "bash":
+                return PermissionResultAllow()
+
+            current = dict(tool_input or {})
+            requested_cwd = str(current.get("cwd") or "").strip()
+            target_cwd = _safe_realpath(working_dir, requested_cwd or ".")
+            if not _is_within_root(target_cwd, working_dir):
+                self._log(
+                    "blocked bash tool outside working directory",
+                    level="WARNING",
+                    requested_cwd=requested_cwd or ".",
+                    resolved_cwd=target_cwd,
+                    working_dir=working_dir,
+                )
+                return PermissionResultDeny(
+                    message="Bash is limited to the current working directory.",
+                    interrupt=False,
+                )
+
+            command = str(current.get("command") or "")
+            for cd_target in _extract_cd_targets(command):
+                resolved = _safe_realpath(target_cwd, cd_target)
+                if not _is_within_root(resolved, working_dir):
+                    self._log(
+                        "blocked bash cd outside working directory",
+                        level="WARNING",
+                        cd_target=cd_target,
+                        resolved_path=resolved,
+                        working_dir=working_dir,
+                    )
+                    return PermissionResultDeny(
+                        message="Bash cd paths must stay inside the working directory.",
+                        interrupt=False,
+                    )
+
+            updated = dict(current)
+            updated["cwd"] = target_cwd
+            return PermissionResultAllow(updated_input=updated)
+
         options = ClaudeAgentOptions(
             model=str(model or ""),
             system_prompt=system_prompt,
@@ -305,12 +410,9 @@ class ClaudeSdkLoop:
             continue_conversation=True,
             resume=resume_session_id or None,
             mcp_servers={self.SERVER_NAME: mcp_server},
-            allowed_tools=[
-                "run_pymol_command",
-                "capture_viewer_snapshot",
-            ],
             env=mapped_env,
-            cwd=os.getcwd(),
+            cwd=working_dir,
+            can_use_tool=can_use_tool,
             max_buffer_size=max_buffer_size if max_buffer_size and max_buffer_size > 0 else None,
         )
         self._log(
@@ -326,6 +428,11 @@ class ClaudeSdkLoop:
         final_text = ""
         session_id = resume_session_id or None
         in_tool_use_block = False
+        active_tool_use_id = ""
+        active_tool_use_name = ""
+        active_tool_input_json = ""
+        known_tool_uses: Dict[str, Dict[str, Any]] = {}
+        reported_tool_result_ids = set()
 
         async with ClaudeSDKClient(options=options) as client:
             await client.query(prompt=prompt, session_id="default")
@@ -356,16 +463,48 @@ class ClaudeSdkLoop:
                         block_data = _to_mapping(event_data.get("content_block"))
                         if str(block_data.get("type") or "") == "tool_use":
                             in_tool_use_block = True
+                            active_tool_use_id = str(block_data.get("id") or "")
+                            active_tool_use_name = str(block_data.get("name") or "")
+                            active_tool_input_json = ""
+                            if active_tool_use_id:
+                                known_tool_uses[active_tool_use_id] = {
+                                    "name": active_tool_use_name,
+                                    "input": {},
+                                }
                             if self._trace_stream:
-                                self._log("sdk tool_use block started", level="DEBUG")
+                                self._log(
+                                    "sdk tool_use block started",
+                                    level="DEBUG",
+                                    tool_name=str(block_data.get("name") or ""),
+                                    tool_id=str(block_data.get("id") or ""),
+                                )
+                        continue
+
+                    if event_type == "message_start":
+                        if on_message_boundary:
+                            on_message_boundary()
                         continue
 
                     if event_type == "content_block_stop":
                         if in_tool_use_block:
+                            if active_tool_use_id and active_tool_input_json.strip():
+                                known_tool_uses[active_tool_use_id] = {
+                                    "name": active_tool_use_name,
+                                    "input": _as_json_dict(active_tool_input_json),
+                                }
                             in_tool_use_block = False
+                            active_tool_use_id = ""
+                            active_tool_use_name = ""
+                            active_tool_input_json = ""
                             if self._trace_stream:
                                 self._log("sdk tool_use block ended", level="DEBUG")
                         continue
+
+                    if event_type == "content_block_delta" and in_tool_use_block:
+                        if delta_type == "input_json_delta":
+                            fragment = str(delta_data.get("partial_json") or delta_data.get("text") or "")
+                            if fragment:
+                                active_tool_input_json += fragment
 
                     text, reasoning = _extract_stream_chunks(message)
                     if text:
@@ -384,17 +523,112 @@ class ClaudeSdkLoop:
 
                 if cls_name == "AssistantMessage":
                     a_text, a_reasoning = _extract_assistant_text(message)
+                    content = getattr(message, "content", None) or []
+                    tool_use_count = 0
+                    tool_result_count = 0
+                    for block in content:
+                        data = _to_mapping(block)
+                        block_type = _assistant_block_type(block)
+                        if block_type == "tool_use":
+                            tool_use_count += 1
+                            tool_id = str(data.get("id") or "")
+                            tool_name = str(data.get("name") or "")
+                            tool_input = data.get("input")
+                            if not isinstance(tool_input, dict):
+                                tool_input = {}
+                            if tool_id:
+                                known_tool_uses[tool_id] = {
+                                    "name": tool_name,
+                                    "input": dict(tool_input),
+                                }
+                        elif block_type == "tool_result":
+                            tool_result_count += 1
+                            tool_use_id = str(data.get("tool_use_id") or "")
+                            if tool_use_id in reported_tool_result_ids:
+                                continue
+                            reported_tool_result_ids.add(tool_use_id)
+                            parent = known_tool_uses.get(tool_use_id) or {}
+                            parent_name = str(parent.get("name") or "")
+                            parent_input = parent.get("input")
+                            if not isinstance(parent_input, dict):
+                                parent_input = {}
+                            if on_tool_result:
+                                on_tool_result(
+                                    tool_use_id,
+                                    parent_name,
+                                    dict(parent_input),
+                                    data.get("content"),
+                                    data.get("is_error"),
+                                )
                     if self._trace_stream:
                         self._log(
                             "sdk assistant message",
                             level="DEBUG",
                             text_chars=len(a_text),
                             reasoning_chars=len(a_reasoning),
+                            tool_use_blocks=tool_use_count,
+                            tool_result_blocks=tool_result_count,
                         )
                     if a_text:
                         final_text = a_text
                     if a_reasoning and on_reasoning_chunk:
                         on_reasoning_chunk(a_reasoning)
+                    continue
+
+                if cls_name == "UserMessage":
+                    parent_tool_use_id = str(getattr(message, "parent_tool_use_id", "") or "")
+                    tool_use_result = getattr(message, "tool_use_result", None)
+                    content = getattr(message, "content", None) or []
+                    emitted = 0
+
+                    if parent_tool_use_id and parent_tool_use_id not in reported_tool_result_ids:
+                        parent = known_tool_uses.get(parent_tool_use_id) or {}
+                        parent_name = str(parent.get("name") or "")
+                        parent_input = parent.get("input")
+                        if not isinstance(parent_input, dict):
+                            parent_input = {}
+                        if on_tool_result:
+                            on_tool_result(
+                                parent_tool_use_id,
+                                parent_name,
+                                dict(parent_input),
+                                tool_use_result,
+                                False,
+                            )
+                            emitted += 1
+                        reported_tool_result_ids.add(parent_tool_use_id)
+
+                    for block in content:
+                        data = _to_mapping(block)
+                        block_type = _assistant_block_type(block)
+                        if block_type != "tool_result":
+                            continue
+                        tool_use_id = str(data.get("tool_use_id") or parent_tool_use_id or "")
+                        if not tool_use_id or tool_use_id in reported_tool_result_ids:
+                            continue
+                        parent = known_tool_uses.get(tool_use_id) or {}
+                        parent_name = str(parent.get("name") or "")
+                        parent_input = parent.get("input")
+                        if not isinstance(parent_input, dict):
+                            parent_input = {}
+                        if on_tool_result:
+                            on_tool_result(
+                                tool_use_id,
+                                parent_name,
+                                dict(parent_input),
+                                data.get("content"),
+                                data.get("is_error"),
+                            )
+                            emitted += 1
+                        reported_tool_result_ids.add(tool_use_id)
+
+                    if self._trace_stream and (parent_tool_use_id or content):
+                        self._log(
+                            "sdk user message tool results",
+                            level="DEBUG",
+                            parent_tool_use_id=parent_tool_use_id,
+                            emitted=emitted,
+                        )
                     continue
 
                 if cls_name == "ResultMessage":
