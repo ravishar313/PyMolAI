@@ -53,6 +53,7 @@ def test_create_bundle_append_and_checkpoint(tmp_path):
     assert payload["session_exists"] is True
     assert len(payload["events"]) == 2
     assert payload["manifest"]["runtime_state"]["input_mode"] == "ai"
+    assert payload["manifest"]["runtime_state"]["backend"] == "claude_sdk"
 
 
 def test_list_search_and_pagination(tmp_path):
@@ -117,12 +118,17 @@ def test_runtime_state_is_truncated_and_mode_sanitized(tmp_path):
     chat_id = store.create_chat("state")
     history = [{"role": "user", "content": str(i)} for i in range(120)]
 
-    store.set_runtime_state(chat_id, {"input_mode": "CLI", "history": history, "model_info": "bad"})
+    store.set_runtime_state(
+        chat_id,
+        {"input_mode": "CLI", "backend": "claude_sdk", "sdk_session_id": "sess_x", "history": history, "model_info": "bad"},
+    )
     store.flush_now()
 
     payload = store.load_chat(chat_id)
     state = payload["manifest"]["runtime_state"]
     assert state["input_mode"] == "cli"
+    assert state["backend"] == "claude_sdk"
+    assert state["sdk_session_id"] == "sess_x"
     assert len(state["history"]) == 80
     assert isinstance(state["model_info"], dict)
 

@@ -1,20 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
-from .doom_loop_detector import DoomLoopDetector
-from .message_types import ToolCall, UiEvent, UiRole
-from .openrouter_client import (
-    DEFAULT_MODEL,
-    OpenRouterClient,
-    OpenRouterClientError,
-    build_multimodal_user_content,
-)
+from .claude_sdk_loop import ClaudeSdkLoop
+from .message_types import UiEvent, UiRole
+from .openrouter_client import DEFAULT_MODEL
 from .state_snapshot import build_viewer_state_snapshot
 from .tool_execution import run_pymol_command
 from .vision_capture import capture_viewer_snapshot
@@ -32,6 +28,8 @@ Rules:
 - capture_viewer_snapshot is INTERNAL validation only. The user cannot see this image in chat.
 - Never say you are taking a screenshot "to show" the user.
 - If you use capture_viewer_snapshot, describe it as internal validation of viewer state.
+- After state-changing commands, use capture_viewer_snapshot to verify the scene actually reflects the requested outcome.
+- Do not claim completion until scene validation has been performed (or explicitly explain why validation failed).
 - Do not repeat the same setup sentence or intent text step after step.
 - If a strategy fails repeatedly, switch approach or ask the user for clarification.
 - Do not re-run the same successful command in the same request unless you clearly explain why.
@@ -50,7 +48,6 @@ _RE_PDB_ID = re.compile(r"^[0-9][A-Za-z0-9]{3}$")
 _HIDDEN_SYSTEM_PREFIXES = (
     "Validation required:",
     "Visual validation required now:",
-    "DOOM LOOP DETECTED:",
 )
 
 
@@ -71,6 +68,9 @@ def _env_float(name: str, default: float) -> float:
 class AiRuntime:
     def __init__(self, cmd):
         self.cmd = cmd
+        self._logger = logging.getLogger("pymol.ai")
+        self._log_to_terminal = os.getenv("PYMOL_AI_LOG_STDOUT", "1") != "0"
+        self._log_to_python_logger = os.getenv("PYMOL_AI_LOGGER", "0") == "1"
         self.history: List[Dict[str, object]] = []
         self.model = os.getenv("PYMOL_AI_DEFAULT_MODEL") or DEFAULT_MODEL
         self.reasoning_visible = False
@@ -78,12 +78,12 @@ class AiRuntime:
         self.final_answer_enabled = os.getenv("PYMOL_AI_FINAL_ANSWER", "1") != "0"
 
         self.max_agent_steps = _env_int("PYMOL_AI_MAX_STEPS", 16)
-        self.max_auto_repairs = _env_int("PYMOL_AI_MAX_REPAIRS", 4)
         self.tool_result_max_chars = _env_int("PYMOL_AI_TOOL_RESULT_MAX_CHARS", 4096)
-        self.doom_loop_threshold = _env_int("PYMOL_AI_DOOM_LOOP_THRESHOLD", 3)
         self.long_tool_warn_sec = _env_float("PYMOL_AI_LONG_TOOL_WARN_SEC", 8.0)
         self.ui_event_batch = max(1, _env_int("PYMOL_AI_UI_EVENT_BATCH", 40))
         self.ui_max_events = max(0, _env_int("PYMOL_AI_UI_MAX_EVENTS", 2000))
+        self.sdk_max_buffer_size = max(0, _env_int("PYMOL_AI_SDK_MAX_BUFFER_SIZE", 10 * 1024 * 1024))
+        self.trace_stream_chunks = _env_int("PYMOL_AI_TRACE_STREAM", 1) == 1
 
         self.screenshot_width = _env_int("PYMOL_AI_SCREENSHOT_WIDTH", 1024)
         self.screenshot_height = _env_int("PYMOL_AI_SCREENSHOT_HEIGHT", 0)
@@ -101,16 +101,28 @@ class AiRuntime:
 
         self._stream_line_buffer = ""
         self._stream_had_output = False
+        self._stream_full_text = ""
 
         disabled = os.getenv("PYMOL_AI_DISABLE", "").strip() == "1"
         self.enabled = bool(self._api_key) and not disabled
 
-        self._client: Optional[OpenRouterClient] = None
+        self._agent_backend = "claude_sdk"
+        self._sdk_session_id: Optional[str] = None
+        self._sdk_loop = ClaudeSdkLoop(logger=self._log_ai)
+        self._sdk_loop.map_openrouter_env()
         self._recent_tool_results: List[Dict[str, object]] = []
+        self._log_ai(
+            "runtime initialized",
+            enabled=self.enabled,
+            input_mode=self.input_mode,
+            model=self.model,
+            backend=self._agent_backend,
+            api_key_set=bool(self._api_key),
+        )
 
     @property
     def _api_key(self) -> str:
-        return os.getenv("OPENROUTER_API_KEY", "").strip()
+        return (os.getenv("OPENROUTER_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN") or "").strip()
 
     def set_reasoning_visible(self, visible: bool) -> None:
         self.reasoning_visible = bool(visible)
@@ -122,10 +134,32 @@ class AiRuntime:
     def current_input_mode(self) -> str:
         return self.input_mode
 
+    @staticmethod
+    def _log_value(value: object, max_len: int = 220) -> str:
+        text = str(value).replace("\n", "\\n")
+        if len(text) > max_len:
+            return text[:max_len] + "...(truncated)"
+        return text
+
+    def _log_ai(self, message: str, level: str = "INFO", **fields) -> None:
+        parts = []
+        for key, value in fields.items():
+            parts.append("%s=%s" % (key, self._log_value(value)))
+        line = "[PyMolAI] %s %s" % (level.upper(), message)
+        if parts:
+            line += " | " + " ".join(parts)
+
+        if self._log_to_terminal:
+            print(line)
+        if self._log_to_python_logger:
+            log_level = getattr(logging, str(level).upper(), logging.INFO)
+            self._logger.log(log_level, line)
+
     def request_cancel(self) -> bool:
         self._cancel_event.set()
         with self._lock:
             busy = bool(self._busy)
+        self._log_ai("cancel requested", busy=busy)
         if busy:
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="cancellation requested..."))
         return busy
@@ -133,14 +167,34 @@ class AiRuntime:
     def clear_session(self, emit_notice: bool = True) -> None:
         self.history.clear()
         self._stream_line_buffer = ""
+        self._stream_full_text = ""
         self._recent_tool_results.clear()
+        self._sdk_session_id = None
+        self._log_ai("session cleared", emit_notice=emit_notice)
         if emit_notice:
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="session memory cleared"))
+
+    def ensure_ai_default_mode(self, emit_notice: bool = False) -> bool:
+        disabled = os.getenv("PYMOL_AI_DISABLE", "").strip() == "1"
+        has_key = bool(self._api_key)
+        self.input_mode = "ai"
+        self.enabled = has_key and not disabled
+        self._log_ai(
+            "ensure default ai mode",
+            enabled=self.enabled,
+            has_key=has_key,
+            disabled=disabled,
+        )
+        if emit_notice and self.enabled:
+            self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="AI enabled"))
+        return self.enabled
 
     def export_session_state(self) -> Dict[str, object]:
         return {
             "input_mode": "cli" if self.input_mode == "cli" else "ai",
             "history": list(self.history[-80:]),
+            "backend": self._agent_backend,
+            "sdk_session_id": self._sdk_session_id,
             "model_info": {
                 "model": self.model,
                 "enabled": bool(self.enabled),
@@ -152,9 +206,13 @@ class AiRuntime:
     def import_session_state(self, state: Optional[Dict[str, object]], apply_model: bool = False) -> None:
         payload = dict(state or {})
         self._stream_line_buffer = ""
+        self._stream_full_text = ""
 
         mode = "cli" if str(payload.get("input_mode") or "").lower() == "cli" else "ai"
         self.input_mode = mode
+        self._agent_backend = str(payload.get("backend") or "claude_sdk")
+        session_id = str(payload.get("sdk_session_id") or "").strip()
+        self._sdk_session_id = session_id or None
 
         history = payload.get("history") or []
         if isinstance(history, list):
@@ -172,6 +230,14 @@ class AiRuntime:
                     self.enabled = bool(model_info.get("enabled"))
                 if "reasoning_visible" in model_info:
                     self.reasoning_visible = bool(model_info.get("reasoning_visible"))
+        self._log_ai(
+            "session state imported",
+            apply_model=apply_model,
+            input_mode=self.input_mode,
+            history_len=len(self.history),
+            sdk_session_id=bool(self._sdk_session_id),
+            enabled=self.enabled,
+        )
 
     def emit_ui_event(self, event: UiEvent) -> None:
         if event.role == UiRole.SYSTEM and self._is_internal_system_reminder(event.text):
@@ -249,6 +315,13 @@ class AiRuntime:
         if not stripped:
             return False
 
+        self._log_ai(
+            "input received",
+            input_mode=self.input_mode,
+            enabled=self.enabled,
+            busy=self._busy,
+            text=stripped,
+        )
         self.emit_ui_event(UiEvent(role=UiRole.USER, text=stripped))
 
         if stripped.startswith("/cli"):
@@ -260,10 +333,12 @@ class AiRuntime:
             return True
 
         if self.input_mode == "cli":
+            self._log_ai("routing to CLI execution", command=raw)
             self._execute_cli_command(raw)
             return True
 
         if not self.enabled:
+            self._log_ai("ai request rejected: disabled", level="WARNING", text=raw)
             self.emit_ui_event(
                 UiEvent(
                     role=UiRole.ERROR,
@@ -281,16 +356,12 @@ class AiRuntime:
             return call(fn)
         return fn()
 
-    def _client_or_error(self) -> OpenRouterClient:
-        if self._client is None:
-            self._client = OpenRouterClient(api_key=self._api_key)
-        return self._client
-
     def _handle_cli_control(self, command: str) -> None:
         rest = command[len("/cli") :].strip()
 
         if not rest or rest == "on":
             self.input_mode = "cli"
+            self._log_ai("cli mode enabled")
             self.emit_ui_event(
                 UiEvent(role=UiRole.SYSTEM, text="CLI mode enabled. Commands are executed directly")
             )
@@ -298,6 +369,7 @@ class AiRuntime:
 
         if rest == "off":
             self.input_mode = "ai"
+            self._log_ai("cli mode disabled; ai mode selected")
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="AI mode enabled"))
             return
 
@@ -307,19 +379,40 @@ class AiRuntime:
 
         self._execute_cli_command(rest)
 
+    def _enable_ai(self) -> bool:
+        if not self._api_key:
+            self.enabled = False
+            self._log_ai("failed to enable AI: missing API key", level="ERROR")
+            self.emit_ui_event(
+                UiEvent(
+                    role=UiRole.ERROR,
+                    text="OPENROUTER_API_KEY (or ANTHROPIC_AUTH_TOKEN) is not set. Export it and retry /ai on",
+                )
+            )
+            return False
+        if os.getenv("PYMOL_AI_DISABLE", "").strip() == "1":
+            self.enabled = False
+            self._log_ai("failed to enable AI: PYMOL_AI_DISABLE=1", level="ERROR")
+            self.emit_ui_event(UiEvent(role=UiRole.ERROR, text="PYMOL_AI_DISABLE=1 is set. Unset it to enable AI"))
+            return False
+        self.enabled = True
+        self.input_mode = "ai"
+        self._log_ai("ai enabled", model=self.model)
+        self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="AI enabled"))
+        return True
+
     def _handle_ai_control(self, command: str) -> None:
         parts = command.split()
 
         if len(parts) == 1:
-            self.input_mode = "ai"
-            self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="AI mode enabled"))
+            self._enable_ai()
             return
 
         if parts[1].lower() == "help":
             self.emit_ui_event(
                 UiEvent(
                     role=UiRole.SYSTEM,
-                    text="/ai (switch to AI mode) | /ai on | /ai off | /ai model <id> | /ai clear | /ai help",
+                    text="/ai (same as /ai on) | /ai on | /ai off | /ai model <id> | /ai clear | /ai help",
                 )
             )
             return
@@ -327,23 +420,12 @@ class AiRuntime:
         action = parts[1].lower()
 
         if action == "on":
-            if not self._api_key:
-                self.enabled = False
-                self.emit_ui_event(
-                    UiEvent(role=UiRole.ERROR, text="OPENROUTER_API_KEY is not set. Export it and retry /ai on")
-                )
-                return
-            if os.getenv("PYMOL_AI_DISABLE", "").strip() == "1":
-                self.enabled = False
-                self.emit_ui_event(UiEvent(role=UiRole.ERROR, text="PYMOL_AI_DISABLE=1 is set. Unset it to enable AI"))
-                return
-            self.enabled = True
-            self.input_mode = "ai"
-            self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="AI enabled"))
+            self._enable_ai()
             return
 
         if action == "off":
             self.enabled = False
+            self._log_ai("ai disabled via /ai off")
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="AI disabled"))
             return
 
@@ -352,6 +434,7 @@ class AiRuntime:
                 self.emit_ui_event(UiEvent(role=UiRole.ERROR, text="usage: /ai model <openrouter_model_id>"))
                 return
             self.model = parts[2]
+            self._log_ai("ai model changed", model=self.model)
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="model set to %s" % (self.model,)))
             return
 
@@ -364,10 +447,12 @@ class AiRuntime:
     def _start_agent_request(self, prompt: str) -> None:
         with self._lock:
             if self._busy:
+                self._log_ai("request skipped because worker is busy", level="WARNING")
                 self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="request already in progress"))
                 return
             self._busy = True
             self._cancel_event.clear()
+        self._log_ai("starting ai worker", prompt=prompt, resume_session_id=self._sdk_session_id or "")
 
         thread = threading.Thread(
             target=self._agent_worker,
@@ -392,88 +477,46 @@ class AiRuntime:
             )
         )
 
-    def _build_messages(
-        self,
-        prompt: str,
-        *,
-        snapshot_image_data_url: Optional[str] = None,
-        snapshot_state_summary: Optional[Dict[str, object]] = None,
-    ) -> List[Dict[str, object]]:
-        state_summary = snapshot_state_summary or self._state_summary_for_prompt()
-
-        msgs: List[Dict[str, object]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "system",
-                "content": "Current viewer state (compact JSON):\n%s"
-                % (json.dumps(state_summary, ensure_ascii=False),),
-            },
+    def _build_turn_prompt(self, prompt: str, *, include_history_context: bool) -> str:
+        state_summary = self._state_summary_for_prompt()
+        lines = [
+            "Current viewer state (compact JSON):",
+            json.dumps(state_summary, ensure_ascii=False),
         ]
-        msgs.extend(self.history[-60:])
 
-        if snapshot_image_data_url:
-            msgs.append(
-                {
-                    "role": "user",
-                    "content": build_multimodal_user_content(
-                        "Visual validation context for current viewer state.",
-                        snapshot_image_data_url,
-                    ),
-                }
-            )
+        if include_history_context:
+            lines.append("")
+            lines.append("Conversation context:")
+            for msg in self.history[-40:]:
+                role = str(msg.get("role") or "").strip()
+                if role not in ("user", "assistant", "system"):
+                    continue
+                content = str(msg.get("content") or "").strip()
+                if not content:
+                    continue
+                lines.append("%s: %s" % (role, content[:500]))
 
-        msgs.append({"role": "user", "content": prompt})
-        return msgs
-
-    def _agent_tools(self) -> List[Dict[str, object]]:
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": "run_pymol_command",
-                    "description": "Run a single PyMOL command in the current session.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "command": {"type": "string"},
-                            "rationale": {"type": "string"},
-                        },
-                        "required": ["command"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "capture_viewer_snapshot",
-                    "description": (
-                        "Capture current PyMOL viewport screenshot and compact viewer state summary. "
-                        "Use ONLY for internal visual validation before final answer when scene changed. "
-                        "Do not claim this screenshot is shown to the user."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "purpose": {"type": "string"},
-                        },
-                        "required": [],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-        ]
+        lines.append("")
+        lines.append("User request:")
+        lines.append(str(prompt or ""))
+        return "\n".join(lines)
 
     def _on_assistant_chunk(self, chunk: str) -> None:
         if self._cancel_event.is_set():
             return
-        if chunk:
-            self._stream_had_output = True
-        self._stream_line_buffer += chunk
-        while "\n" in self._stream_line_buffer:
-            line, self._stream_line_buffer = self._stream_line_buffer.split("\n", 1)
-            if line.strip():
-                self.emit_ui_event(UiEvent(role=UiRole.AI, text=line.strip()))
+        piece = str(chunk or "")
+        if not piece:
+            return
+        self._stream_had_output = True
+        self._stream_full_text += piece
+        if self.trace_stream_chunks:
+            self._log_ai(
+                "stream chunk",
+                level="DEBUG",
+                chars=len(piece),
+                preview=piece[:120],
+            )
+        self.emit_ui_event(UiEvent(role=UiRole.AI, text=piece, metadata={"stream_chunk": True}))
 
     def _flush_assistant_chunks(self) -> None:
         if self._stream_line_buffer.strip():
@@ -514,8 +557,16 @@ class AiRuntime:
         if note:
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text=note))
 
+        self._log_ai("executing cli command", command=fixed)
         self._append_history({"role": "user", "content": "CLI command: %s" % (fixed,)})
         result = self._run_in_gui(lambda c=fixed: run_pymol_command(self.cmd, c))
+        self._log_ai(
+            "cli command finished",
+            command=result.command,
+            ok=result.ok,
+            error=result.error or "",
+            feedback_lines=len(result.feedback_lines or []),
+        )
         self._remember_tool_result(result.command, result.ok, result.error)
         payload = {
             "ok": result.ok,
@@ -537,18 +588,6 @@ class AiRuntime:
                 },
             )
         )
-
-    def _assistant_message_with_tools(self, assistant_text: str, tool_calls: List[ToolCall]) -> Dict[str, object]:
-        tc_payload = []
-        for tc in tool_calls:
-            tc_payload.append(
-                {
-                    "id": tc.tool_call_id,
-                    "type": "function",
-                    "function": {"name": tc.name, "arguments": tc.arguments_json},
-                }
-            )
-        return {"role": "assistant", "content": assistant_text, "tool_calls": tc_payload}
 
     def _tool_result_content(self, payload: Dict[str, object]) -> str:
         return json.dumps(payload, ensure_ascii=False)
@@ -589,13 +628,7 @@ class AiRuntime:
         return payload, image_data_url, state_summary
 
     def _agent_worker(self, prompt: str) -> None:
-        detector = DoomLoopDetector(threshold=self.doom_loop_threshold)
-
-        snapshot_image_data_url: Optional[str] = None
-        snapshot_state_summary: Optional[Dict[str, object]] = None
         cancelled = False
-        successful_commands_this_turn = set()
-        loop_nudged_at_step = 0
 
         def is_cancelled() -> bool:
             return self._cancel_event.is_set()
@@ -609,300 +642,241 @@ class AiRuntime:
                 cancelled = True
             return True
 
-        def maybe_handle_stall(loop: Dict[str, object], step_index: int) -> bool:
-            nonlocal loop_nudged_at_step
-            if not loop:
-                return False
-
-            if loop_nudged_at_step == 0:
-                loop_type = str(loop.get("loop_type") or "stall")
-                family = str(loop.get("command_family") or "").strip()
-                hidden = (
-                    "DOOM LOOP DETECTED: %s%s. Stop repeating the same setup phrasing. "
-                    "Switch approach or ask the user to clarify target selection."
-                    % (loop_type, (" (%s)" % family) if family else "")
-                )
-                self._append_history({"role": "system", "content": hidden})
-                loop_nudged_at_step = step_index
-                return False
-
-            if step_index <= loop_nudged_at_step:
-                return False
-
-            stuck = "I'm stuck; please narrow or clarify the target selection."
-            self.emit_ui_event(UiEvent(role=UiRole.ERROR, text=stuck))
-            self._append_history({"role": "assistant", "content": stuck})
-            return True
-
         try:
+            self._log_ai("agent turn started", prompt=prompt)
             if check_cancel():
                 return
+
             self._append_history({"role": "user", "content": prompt})
+            self._stream_had_output = False
+            self._stream_line_buffer = ""
+            self._stream_full_text = ""
 
             pending_validation_required = False
             validation_done_this_turn = False
             slow_tool_notice_emitted = False
+            snapshot_state_summary: Optional[Dict[str, object]] = None
 
-            for step in range(1, self.max_agent_steps + 1):
-                if check_cancel():
+            def maybe_emit_slow_tool_warning(elapsed: float) -> None:
+                nonlocal slow_tool_notice_emitted
+                if self.long_tool_warn_sec < 0:
                     return
+                if elapsed < self.long_tool_warn_sec:
+                    return
+                if slow_tool_notice_emitted:
+                    return
+                self.emit_ui_event(
+                    UiEvent(
+                        role=UiRole.SYSTEM,
+                        text=(
+                            "tool step took %.1fs; UI may be busy during heavy PyMOL operations"
+                            % (elapsed,)
+                        ),
+                    )
+                )
+                self._log_ai("slow tool warning emitted", elapsed="%.3f" % (elapsed,))
+                slow_tool_notice_emitted = True
 
-                messages = self._build_messages(
-                    prompt,
-                    snapshot_image_data_url=snapshot_image_data_url,
-                    snapshot_state_summary=snapshot_state_summary,
+            def execute_run_command_tool(tool_call_id: str, tool_args: Dict[str, object]) -> Dict[str, object]:
+                nonlocal pending_validation_required
+                command = str(tool_args.get("command") or "").strip()
+                command, note = self._canonicalize_command(command)
+                if note:
+                    self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text=note))
+
+                self._log_ai("tool run start", tool_call_id=tool_call_id, command=command)
+                started = time.monotonic()
+                exec_result = self._run_in_gui(lambda c=command: run_pymol_command(self.cmd, c))
+                elapsed = time.monotonic() - started
+                maybe_emit_slow_tool_warning(elapsed)
+                self._log_ai(
+                    "tool run done",
+                    tool_call_id=tool_call_id,
+                    command=exec_result.command,
+                    ok=exec_result.ok,
+                    elapsed="%.3f" % (elapsed,),
+                    error=exec_result.error or "",
                 )
 
-                # Ephemeral image: use for immediate call and then clear.
-                snapshot_image_data_url = None
+                self._remember_tool_result(exec_result.command, exec_result.ok, exec_result.error)
+                payload = {
+                    "ok": exec_result.ok,
+                    "command": exec_result.command,
+                    "error": exec_result.error or None,
+                    "feedback_lines": exec_result.feedback_lines,
+                }
+                metadata = {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": "run_pymol_command",
+                    "tool_args": dict(tool_args or {}),
+                    "tool_command": command,
+                    "tool_result_json": self._tool_result_metadata_payload(payload),
+                }
+                self.emit_ui_event(
+                    UiEvent(
+                        role=UiRole.TOOL_RESULT,
+                        text="Executed: %s" % (command,),
+                        ok=bool(payload.get("ok")),
+                        metadata=metadata,
+                    )
+                )
 
-                self._stream_had_output = False
-                turn = self._client_or_error().stream_assistant_turn(
+                msg_content = self._tool_result_content(payload)
+                if len(msg_content) > self.tool_result_max_chars:
+                    msg_content = msg_content[: self.tool_result_max_chars] + "... [truncated]"
+                self._append_history(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": "run_pymol_command",
+                        "content": msg_content,
+                    }
+                )
+
+                if self._is_state_changing_command(str(payload.get("command") or command)):
+                    pending_validation_required = True
+
+                return payload
+
+            def execute_snapshot_tool(tool_call_id: str, tool_args: Dict[str, object]) -> Dict[str, object]:
+                nonlocal pending_validation_required, validation_done_this_turn, snapshot_state_summary
+                self._log_ai("snapshot tool start", tool_call_id=tool_call_id, args=tool_args)
+                started = time.monotonic()
+                payload, image_data_url, state_summary = self._execute_snapshot_tool()
+                elapsed = time.monotonic() - started
+                maybe_emit_slow_tool_warning(elapsed)
+                self._log_ai(
+                    "snapshot tool done",
+                    tool_call_id=tool_call_id,
+                    ok=bool(payload.get("ok")),
+                    elapsed="%.3f" % (elapsed,),
+                    error=payload.get("error") or "",
+                )
+
+                snapshot_state_summary = state_summary
+                metadata = {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": "capture_viewer_snapshot",
+                    "tool_args": dict(tool_args or {}),
+                    "tool_command": None,
+                    "tool_result_json": self._tool_result_metadata_payload(payload),
+                }
+                if payload["ok"]:
+                    metadata["visual_validation"] = "validated: screenshot+state"
+                else:
+                    metadata["visual_validation"] = "validated: state-only (screenshot failed)"
+
+                self.emit_ui_event(
+                    UiEvent(
+                        role=UiRole.TOOL_RESULT,
+                        text="Executed: capture_viewer_snapshot",
+                        ok=bool(payload.get("ok")),
+                        metadata=metadata,
+                    )
+                )
+
+                self._append_history(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": "capture_viewer_snapshot",
+                        "content": self._tool_result_content(payload),
+                    }
+                )
+
+                validation_done_this_turn = True
+                pending_validation_required = False
+                return {
+                    "payload": payload,
+                    "image_data_url": image_data_url,
+                }
+
+            def run_sdk_turn(request_prompt: str, resume_session_id: Optional[str]):
+                return self._sdk_loop.run_turn(
+                    prompt=request_prompt,
                     model=self.model,
-                    messages=messages,
-                    tools=self._agent_tools(),
+                    system_prompt=SYSTEM_PROMPT,
+                    max_turns=self.max_agent_steps,
+                    resume_session_id=resume_session_id,
                     on_text_chunk=self._on_assistant_chunk,
                     on_reasoning_chunk=(
                         (lambda t: self.reasoning_visible and self.emit_ui_event(UiEvent(role=UiRole.REASONING, text=t)))
                     ),
                     should_cancel=is_cancelled,
+                    run_command_tool=execute_run_command_tool,
+                    snapshot_tool=execute_snapshot_tool,
+                    max_buffer_size=self.sdk_max_buffer_size or None,
                 )
-                if check_cancel():
-                    return
 
-                self._flush_assistant_chunks()
-
-                assistant_text = str(turn.get("assistant_text") or "").strip()
-                tool_calls = list(turn.get("tool_calls") or [])
-                intent_loop = detector.add_assistant_intent(assistant_text)
-                if maybe_handle_stall(intent_loop, step):
-                    return
-
-                if not tool_calls:
-                    if self.screenshot_validate_required and pending_validation_required and not validation_done_this_turn:
-                        nudge = (
-                            "Validation required: capture_viewer_snapshot must be called before final answer "
-                            "because scene-changing commands were executed."
-                        )
-                        self._append_history({"role": "system", "content": nudge})
-                        continue
-
-                    # Avoid duplicate final answer if already streamed.
-                    if assistant_text:
-                        if not self._stream_had_output:
-                            self.emit_ui_event(UiEvent(role=UiRole.AI, text=assistant_text))
-                    elif self.final_answer_enabled:
-                        self.emit_ui_event(
-                            UiEvent(
-                                role=UiRole.ERROR,
-                                text="I completed the loop but did not receive a final answer from the model.",
-                            )
-                        )
-                    self._append_history({"role": "assistant", "content": assistant_text})
-                    return
-
-                self._append_history(self._assistant_message_with_tools(assistant_text, tool_calls))
-
-                validation_done_this_turn = False
-
-                for tc in tool_calls:
-                    if check_cancel():
-                        return
-
-                    if tc.name == "capture_viewer_snapshot":
-                        started = time.monotonic()
-                        payload, image_data_url, state_summary = self._execute_snapshot_tool()
-                        elapsed = time.monotonic() - started
-                        snapshot_image_data_url = image_data_url
-                        snapshot_state_summary = state_summary
-
-                        meta = {
-                            "tool_call_id": tc.tool_call_id,
-                            "tool_name": tc.name,
-                            "tool_args": tc.arguments,
-                            "tool_command": None,
-                            "tool_result_json": self._tool_result_metadata_payload(payload),
-                        }
-                        if payload["ok"]:
-                            meta["visual_validation"] = "validated: screenshot+state"
-                            self.emit_ui_event(
-                                UiEvent(
-                                    role=UiRole.TOOL_RESULT,
-                                    text="Executed: capture_viewer_snapshot",
-                                    ok=True,
-                                    metadata=meta,
-                                )
-                            )
-                        else:
-                            meta["visual_validation"] = "validated: state-only (screenshot failed)"
-                            self.emit_ui_event(
-                                UiEvent(
-                                    role=UiRole.TOOL_RESULT,
-                                    text="Executed: capture_viewer_snapshot",
-                                    ok=False,
-                                    metadata=meta,
-                                )
-                            )
-                        if self.long_tool_warn_sec >= 0 and elapsed >= self.long_tool_warn_sec and not slow_tool_notice_emitted:
-                            self.emit_ui_event(
-                                UiEvent(
-                                    role=UiRole.SYSTEM,
-                                    text=(
-                                        "tool step took %.1fs; UI may be busy during heavy PyMOL operations"
-                                        % (elapsed,)
-                                    ),
-                                )
-                            )
-                            slow_tool_notice_emitted = True
-
-                        content = self._tool_result_content(payload)
-                        tool_msg = {
-                            "role": "tool",
-                            "tool_call_id": tc.tool_call_id,
-                            "name": tc.name,
-                            "content": content,
-                        }
-                        self._append_history(tool_msg)
-                        validation_done_this_turn = True
-                        pending_validation_required = False
-                        continue
-
-                    if tc.name != "run_pymol_command":
-                        payload = {
-                            "ok": False,
-                            "command": "",
-                            "error": "unsupported tool: %s" % (tc.name,),
-                            "feedback_lines": [],
-                        }
-                        err_content = self._tool_result_content(payload)
-                        self.emit_ui_event(
-                            UiEvent(
-                                role=UiRole.TOOL_RESULT,
-                                text="Executed: %s" % (tc.name,),
-                                ok=False,
-                                metadata={
-                                    "tool_call_id": tc.tool_call_id,
-                                    "tool_name": tc.name,
-                                    "tool_args": tc.arguments,
-                                    "tool_command": None,
-                                    "tool_result_json": self._tool_result_metadata_payload(payload),
-                                },
-                            )
-                        )
-                        tool_msg = {
-                            "role": "tool",
-                            "tool_call_id": tc.tool_call_id,
-                            "name": tc.name,
-                            "content": err_content,
-                        }
-                        self._append_history(tool_msg)
-                        continue
-
-                    command = str(tc.arguments.get("command") or "").strip()
-                    command, note = self._canonicalize_command(command)
-                    if note:
-                        self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text=note))
-
-                    command_key = self._normalized_command_key(command)
-                    if command_key in successful_commands_this_turn:
-                        payload = {
-                            "ok": True,
-                            "command": command,
-                            "error": None,
-                            "feedback_lines": [],
-                            "skipped": True,
-                            "skip_reason": "duplicate command skipped in current turn",
-                        }
-                    else:
-                        started = time.monotonic()
-                        exec_result = self._run_in_gui(lambda c=command: run_pymol_command(self.cmd, c))
-                        elapsed = time.monotonic() - started
-                        self._remember_tool_result(exec_result.command, exec_result.ok, exec_result.error)
-                        if check_cancel():
-                            return
-                        payload = {
-                            "ok": exec_result.ok,
-                            "command": exec_result.command,
-                            "error": exec_result.error or None,
-                            "feedback_lines": exec_result.feedback_lines,
-                        }
-                        if exec_result.ok:
-                            successful_commands_this_turn.add(command_key)
-                        if self.long_tool_warn_sec >= 0 and elapsed >= self.long_tool_warn_sec and not slow_tool_notice_emitted:
-                            self.emit_ui_event(
-                                UiEvent(
-                                    role=UiRole.SYSTEM,
-                                    text=(
-                                        "tool step took %.1fs; UI may be busy during heavy PyMOL operations"
-                                        % (elapsed,)
-                                    ),
-                                )
-                            )
-                            slow_tool_notice_emitted = True
-
-                    result_text = self._tool_result_content(payload)
-                    self.emit_ui_event(
-                        UiEvent(
-                            role=UiRole.TOOL_RESULT,
-                            text="Executed: %s" % (command,),
-                            ok=bool(payload.get("ok")),
-                            metadata={
-                                "tool_call_id": tc.tool_call_id,
-                                "tool_name": tc.name,
-                                "tool_args": tc.arguments,
-                                "tool_command": command,
-                                "tool_result_json": self._tool_result_metadata_payload(payload),
-                            },
-                        )
-                    )
-
-                    msg_content = result_text
-                    if len(msg_content) > self.tool_result_max_chars:
-                        msg_content = msg_content[: self.tool_result_max_chars] + "... [truncated]"
-
-                    tool_msg = {
-                        "role": "tool",
-                        "tool_call_id": tc.tool_call_id,
-                        "name": tc.name,
-                        "content": msg_content,
-                    }
-                    self._append_history(tool_msg)
-
-                    if self._is_state_changing_command(str(payload.get("command") or command)):
-                        pending_validation_required = True
-
-                    loop = detector.add_call(
-                        tc.name,
-                        tc.arguments,
-                        validation_required=pending_validation_required,
-                    )
-                    if maybe_handle_stall(loop, step):
-                        return
-
-                # If tools executed and validation required but not done, nudge immediately.
-                if self.screenshot_validate_required and pending_validation_required and not validation_done_this_turn:
-                    nudge = (
-                        "Visual validation required now: call capture_viewer_snapshot before final answer."
-                    )
-                    self._append_history({"role": "system", "content": nudge})
-
-            self.emit_ui_event(
-                UiEvent(
-                    role=UiRole.ERROR,
-                    text=(
-                        "Agent reached step limit (%d). Please refine your request or use /cli for direct commands."
-                        % (self.max_agent_steps,)
-                    ),
-                )
+            turn_prompt = self._build_turn_prompt(prompt, include_history_context=False)
+            self._log_ai(
+                "sdk turn run",
+                include_history_context=False,
+                resume_session_id=self._sdk_session_id or "",
+                max_turns=self.max_agent_steps,
+                model=self.model,
             )
-        except OpenRouterClientError as exc:
-            self.emit_ui_event(UiEvent(role=UiRole.ERROR, text=str(exc)))
+            result = run_sdk_turn(turn_prompt, self._sdk_session_id)
+
+            if (
+                result.error_class == "resume_invalid"
+                and self._sdk_session_id
+                and not check_cancel()
+            ):
+                self._sdk_session_id = None
+                turn_prompt = self._build_turn_prompt(prompt, include_history_context=True)
+                self._log_ai("sdk resume invalid; retrying with local history context")
+                result = run_sdk_turn(turn_prompt, None)
+
+            if check_cancel():
+                return
+
+            self._flush_assistant_chunks()
+            self._sdk_session_id = result.session_id or self._sdk_session_id
+            self._log_ai(
+                "sdk turn completed",
+                error_class=result.error_class or "",
+                has_error=bool(result.error),
+                session_id=self._sdk_session_id or "",
+            )
+
+            if result.error:
+                if result.error_class == "cancelled":
+                    check_cancel()
+                    return
+                self._log_ai("sdk turn failed", level="ERROR", error=result.error, error_class=result.error_class or "")
+                self.emit_ui_event(UiEvent(role=UiRole.ERROR, text=str(result.error)))
+                return
+
+            if self.screenshot_validate_required and pending_validation_required and not validation_done_this_turn:
+                execute_snapshot_tool("auto_capture_viewer_snapshot_1", {"purpose": "auto_validation"})
+
+            assistant_text = str(result.assistant_text or "").strip()
+            if assistant_text:
+                self._log_ai("assistant final text emitted", chars=len(assistant_text))
+                if not self._stream_had_output:
+                    self.emit_ui_event(UiEvent(role=UiRole.AI, text=assistant_text))
+                self._append_history({"role": "assistant", "content": assistant_text})
+            elif self._stream_had_output and self._stream_full_text.strip():
+                streamed_text = self._stream_full_text.strip()
+                self._log_ai("assistant final text inferred from streamed chunks", chars=len(streamed_text))
+                self._append_history({"role": "assistant", "content": streamed_text})
+            elif self.final_answer_enabled:
+                self._log_ai("missing final assistant answer from sdk", level="ERROR")
+                self.emit_ui_event(
+                    UiEvent(
+                        role=UiRole.ERROR,
+                        text="I completed the loop but did not receive a final answer from the model.",
+                    )
+                )
         except Exception as exc:  # noqa: BLE001
+            self._log_ai("unexpected runtime exception", level="ERROR", error=exc)
             self.emit_ui_event(UiEvent(role=UiRole.ERROR, text="unexpected error: %s" % (exc,)))
         finally:
             with self._lock:
                 self._busy = False
             self._cancel_event.clear()
+            self._log_ai("agent turn finished", cancelled=cancelled)
 
 
 def get_ai_runtime(cmd, create: bool = True) -> Optional[AiRuntime]:

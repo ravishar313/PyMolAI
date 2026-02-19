@@ -121,6 +121,13 @@ class MessageBubble(QtWidgets.QFrame):
             self._raw_text = chunk
         self.set_text(self._raw_text)
 
+    def append_chunk(self, text: str):
+        chunk = str(text or "")
+        if not chunk:
+            return
+        self._raw_text = self._raw_text + chunk
+        self.set_text(self._raw_text)
+
 
 class ToolResultCard(QtWidgets.QFrame):
     def __init__(
@@ -286,7 +293,7 @@ class AssistantChatPanel(QtWidgets.QWidget):
         self._active_ai_bubble = None
         self._pending_tool_start = ""
         self._last_ai_text = ""
-        self._pending_ai_lines = []
+        self._pending_ai_text = ""
         self._mode = "ai"
         self._max_visible_cards = self.MAX_VISIBLE_CARDS
 
@@ -408,7 +415,7 @@ class AssistantChatPanel(QtWidgets.QWidget):
         self._active_ai_bubble = None
         self._pending_tool_start = ""
         self._last_ai_text = ""
-        self._pending_ai_lines = []
+        self._pending_ai_text = ""
         while self.feed_layout.count() > 1:
             item = self.feed_layout.takeAt(0)
             widget = item.widget()
@@ -453,23 +460,29 @@ class AssistantChatPanel(QtWidgets.QWidget):
             role = getattr(raw_role, "value", raw_role)
             role = str(role)
             text = str(getattr(event, "text", "") or "")
+            metadata = dict(getattr(event, "metadata", None) or {})
 
             if role == "ai":
-                self._append_ai_text(text)
+                self._append_ai_text(text, is_stream_chunk=bool(metadata.get("stream_chunk")))
                 continue
 
             self._flush_pending_ai_text()
-            self._active_ai_bubble = None
 
             if role == "user":
+                self._active_ai_bubble = None
                 self._last_ai_text = ""
                 bubble = MessageBubble("You", kind="user", markdown=False)
                 bubble.set_text(text)
                 self._append_widget(bubble)
             elif role == "tool_start":
+                # End any active assistant bubble before upcoming tool output so
+                # assistant text before/after tools is rendered as separate blocks.
+                self._active_ai_bubble = None
                 self._pending_tool_start = text
             elif role == "tool_result":
-                metadata = dict(getattr(event, "metadata", None) or {})
+                # Tool execution marks a boundary in the assistant response.
+                # Keep pre-tool and post-tool assistant text in separate bubbles.
+                self._active_ai_bubble = None
                 if self._pending_tool_start:
                     metadata.setdefault("tool_command", self._pending_tool_start)
                 self._append_widget(
@@ -486,46 +499,48 @@ class AssistantChatPanel(QtWidgets.QWidget):
                 bubble.set_text(text)
                 self._append_widget(bubble)
             elif role == "error":
+                self._active_ai_bubble = None
                 bubble = MessageBubble("Error", kind="error", markdown=False)
                 bubble.set_text(text)
                 self._append_widget(bubble)
             else:
                 if text.strip().lower() == "planning...":
                     continue
+                self._active_ai_bubble = None
                 bubble = MessageBubble("System", kind="system", markdown=False)
                 bubble.set_text(text)
                 self._append_widget(bubble)
 
-    def _append_ai_text(self, text: str):
-        clean = str(text or "").strip()
-        if not clean:
+    def _append_ai_text(self, text: str, *, is_stream_chunk: bool = False):
+        chunk = str(text or "")
+        if not chunk:
             return
-        if not self._active_ai_bubble and clean == self._last_ai_text:
-            return
-        if self._pending_ai_lines and self._pending_ai_lines[-1] == clean:
-            return
-        if self._active_ai_bubble and self._active_ai_bubble._raw_text:
-            lines = self._active_ai_bubble._raw_text.splitlines()
-            last_line = lines[-1].strip() if lines else ""
-            if last_line == clean:
+        if not is_stream_chunk:
+            clean = chunk.strip()
+            if not clean:
                 return
+            if not self._active_ai_bubble and clean == self._last_ai_text:
+                return
+            if self._pending_ai_text == clean:
+                return
+            chunk = clean + "\n"
         if not self._active_ai_bubble:
             self._active_ai_bubble = MessageBubble("PyMolAI", kind="assistant", markdown=True)
             self._append_widget(self._active_ai_bubble)
-        self._pending_ai_lines.append(clean)
+        self._pending_ai_text += chunk
         if not self._ai_flush_timer.isActive():
             self._ai_flush_timer.start()
 
     def _flush_pending_ai_text(self):
-        if not self._pending_ai_lines:
+        if not self._pending_ai_text:
             return
         if not self._active_ai_bubble:
-            self._pending_ai_lines = []
+            self._pending_ai_text = ""
             return
-        chunk = "\n".join(self._pending_ai_lines)
-        self._pending_ai_lines = []
-        self._active_ai_bubble.append_text(chunk)
-        lines = chunk.splitlines()
+        chunk = self._pending_ai_text
+        self._pending_ai_text = ""
+        self._active_ai_bubble.append_chunk(chunk)
+        lines = self._active_ai_bubble._raw_text.splitlines()
         if lines:
             self._last_ai_text = lines[-1].strip()
         self._scroll_to_bottom()

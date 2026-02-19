@@ -834,6 +834,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         skip_overlay_size_detail = 0
         for line in lines:
             text = str(line or "")
+            if "[PyMolAI]" in text:
+                continue
             if skip_overlay_size_detail > 0:
                 if text.startswith("Image:") or text.startswith("Overlay:"):
                     skip_overlay_size_detail -= 1
@@ -858,6 +860,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         runtime = self.get_ai_runtime(create=False)
         if runtime is not None:
             runtime.clear_session(emit_notice=False)
+            runtime.ensure_ai_default_mode(emit_notice=False)
         current_id = getattr(self._chat_store, "current_chat_id", None)
         if current_id:
             self._chat_store.delete_chat(current_id)
@@ -1051,6 +1054,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         runtime = self.get_ai_runtime(create=False)
         if runtime is not None:
             runtime.clear_session(emit_notice=False)
+            runtime.ensure_ai_default_mode(emit_notice=False)
         self.chat_panel.clear_transcript()
         self._chat_has_user_input = False
 
@@ -1071,6 +1075,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             runtime = self.get_ai_runtime(create=False)
             if runtime is not None:
                 runtime.clear_session(emit_notice=False)
+                runtime.ensure_ai_default_mode(emit_notice=False)
             self.chat_panel.clear_transcript()
             self._chat_has_user_input = False
             self._start_new_chat_session(title_hint="")
