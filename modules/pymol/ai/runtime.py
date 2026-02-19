@@ -13,6 +13,8 @@ from .claude_sdk_loop import ClaudeSdkLoop
 from .message_types import UiEvent, UiRole
 from .openrouter_client import DEFAULT_MODEL
 from .api_key_store import load_saved_key_into_env_if_needed
+from .openbio_api_key_store import load_saved_key_into_env_if_needed as load_openbio_saved_key_into_env_if_needed
+from .openbio_client import execute_openbio_api_gateway_tool
 from .state_snapshot import build_viewer_state_snapshot
 from .tool_execution import run_pymol_command
 from .vision_capture import capture_viewer_snapshot
@@ -97,6 +99,8 @@ class AiRuntime:
         self._log_to_python_logger = os.getenv("PYMOL_AI_LOGGER", "0") == "1"
         key_status = load_saved_key_into_env_if_needed()
         self._api_key_source = key_status.source
+        openbio_key_status = load_openbio_saved_key_into_env_if_needed()
+        self._openbio_api_key_source = openbio_key_status.source
         self.history: List[Dict[str, object]] = []
         self.model = os.getenv("PYMOL_AI_DEFAULT_MODEL") or DEFAULT_MODEL
         self.reasoning_visible = _env_int("PYMOL_AI_REASONING_DEFAULT", 1) == 1
@@ -156,6 +160,8 @@ class AiRuntime:
             backend=self._agent_backend,
             api_key_set=bool(self._api_key),
             api_key_source=self._api_key_source,
+            openbio_api_key_set=bool(self._openbio_api_key),
+            openbio_api_key_source=self._openbio_api_key_source,
             conversation_mode=self.conversation_mode,
             query_session_id=self._chat_query_session_id,
         )
@@ -163,6 +169,10 @@ class AiRuntime:
     @property
     def _api_key(self) -> str:
         return (os.getenv("OPENROUTER_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN") or "").strip()
+
+    @property
+    def _openbio_api_key(self) -> str:
+        return (os.getenv("OPENBIO_API_KEY") or "").strip()
 
     @staticmethod
     def _normalize_agent_mode(mode: str) -> str:
@@ -973,6 +983,65 @@ class AiRuntime:
                     "image_data_url": image_data_url,
                 }
 
+            def execute_openbio_api_tool(
+                tool_call_id: str,
+                tool_name: str,
+                tool_args: Dict[str, object],
+            ) -> Dict[str, object]:
+                payload_args = dict(tool_args or {})
+                resolved_name = str(tool_name or "").strip()
+                self._log_ai(
+                    "openbio tool start",
+                    tool_call_id=tool_call_id,
+                    tool_name=resolved_name,
+                    args=payload_args,
+                )
+                started = time.monotonic()
+                payload = execute_openbio_api_gateway_tool(
+                    resolved_name,
+                    payload_args,
+                    working_dir=os.path.realpath(os.getcwd()),
+                )
+                elapsed = time.monotonic() - started
+                maybe_emit_slow_tool_warning(elapsed)
+                self._log_ai(
+                    "openbio tool done",
+                    tool_call_id=tool_call_id,
+                    tool_name=resolved_name,
+                    ok=bool(payload.get("ok")),
+                    elapsed="%.3f" % (elapsed,),
+                    error=payload.get("error") or "",
+                )
+
+                metadata = {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": resolved_name or "openbio_api_tool",
+                    "tool_args": payload_args,
+                    "tool_command": None,
+                    "tool_result_json": self._tool_result_metadata_payload(payload),
+                }
+                self.emit_ui_event(
+                    UiEvent(
+                        role=UiRole.TOOL_RESULT,
+                        text="Executed: %s" % (resolved_name or "openbio_api_tool",),
+                        ok=bool(payload.get("ok")),
+                        metadata=metadata,
+                    )
+                )
+
+                content = self._tool_result_content(payload)
+                if len(content) > self.tool_result_max_chars:
+                    content = content[: self.tool_result_max_chars] + "... [truncated]"
+                self._append_history(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": resolved_name or "openbio_api_tool",
+                        "content": content,
+                    }
+                )
+                return payload
+
             def execute_external_tool_result(
                 tool_call_id: str,
                 tool_name: str,
@@ -983,7 +1052,7 @@ class AiRuntime:
                 raw_tool_name = str(tool_name or "").strip()
                 canonical_name, display_name = self._normalize_sdk_tool_name(raw_tool_name)
                 normalized = canonical_name or raw_tool_name
-                if normalized in ("run_pymol_command", "capture_viewer_snapshot"):
+                if normalized in ("run_pymol_command", "capture_viewer_snapshot") or normalized.startswith("openbio_api_"):
                     self._log_ai(
                         "ignored mirrored internal mcp tool result",
                         level="DEBUG",
@@ -1067,6 +1136,11 @@ class AiRuntime:
                     should_cancel=is_cancelled,
                     run_command_tool=execute_run_command_tool,
                     snapshot_tool=execute_snapshot_tool,
+                    openbio_api_tool=(
+                        execute_openbio_api_tool
+                        if self._openbio_api_key
+                        else None
+                    ),
                     max_buffer_size=self.sdk_max_buffer_size or None,
                     conversation_mode=self.conversation_mode,
                     include_history_context=include_history_context,

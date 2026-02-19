@@ -226,6 +226,74 @@ def _decode_data_url_image(data_url: str) -> Tuple[Optional[str], Optional[str]]
     return encoded or None, mime_type
 
 
+OPENBIO_GATEWAY_TOOL_SPECS = (
+    (
+        "openbio_api_health",
+        "Check OpenBio API health status.",
+        {},
+    ),
+    (
+        "openbio_api_list_tools",
+        "List OpenBio tools, optionally filtered and paginated.",
+        {"category": str, "limit": int, "offset": int},
+    ),
+    (
+        "openbio_api_search_tools",
+        "Search OpenBio tools by capability query.",
+        {"query": str},
+    ),
+    (
+        "openbio_api_list_categories",
+        "List OpenBio tool categories.",
+        {},
+    ),
+    (
+        "openbio_api_get_category",
+        "Get details for an OpenBio tool category.",
+        {"category_name": str},
+    ),
+    (
+        "openbio_api_get_tool_schema",
+        "Get schema for a specific OpenBio remote tool.",
+        {"tool_name": str},
+    ),
+    (
+        "openbio_api_validate_params",
+        "Validate parameters against an OpenBio remote tool schema. Pass params as an object (not a JSON string).",
+        {"tool_name": str, "params": dict},
+    ),
+    (
+        "openbio_api_invoke_tool",
+        (
+            "Invoke an OpenBio remote tool with params and optional file uploads. "
+            "Pass params as an object. Omit upload_files unless needed. "
+            "If used, upload_files must be a list of path/object entries."
+        ),
+        {"tool_name": str, "params": dict, "upload_files": list},
+    ),
+    (
+        "openbio_api_list_jobs",
+        "List OpenBio jobs with optional filters.",
+        {"limit": int, "offset": int, "status": str, "tool": str, "compact": bool},
+    ),
+    (
+        "openbio_api_get_job_status",
+        "Get status for an OpenBio long-running job.",
+        {"job_id": str},
+    ),
+    (
+        "openbio_api_get_job_result",
+        "Get result payload for an OpenBio long-running job.",
+        {"job_id": str},
+    ),
+    (
+        "openbio_api_get_job_logs",
+        "Get logs for an OpenBio long-running job.",
+        {"job_id": str},
+    ),
+)
+
+
 class ClaudeSdkLoop:
     SERVER_NAME = "pymol_tools"
 
@@ -280,6 +348,7 @@ class ClaudeSdkLoop:
         tool,
         run_command_tool: Callable[[str, Dict[str, Any]], Dict[str, Any]],
         snapshot_tool: Callable[[str, Dict[str, Any]], Dict[str, Any]],
+        openbio_api_tool: Optional[Callable[[str, str, Dict[str, Any]], Dict[str, Any]]] = None,
     ):
         tool_seq = {"n": 0}
 
@@ -335,12 +404,37 @@ class ClaudeSdkLoop:
                 "content": content
             }
 
+        openbio_tools = []
+        if callable(openbio_api_tool):
+            for name, description, schema in OPENBIO_GATEWAY_TOOL_SPECS:
+
+                def _register_openbio_tool(tool_name=name, tool_desc=description, tool_schema=schema):
+                    @tool(tool_name, tool_desc, tool_schema)
+                    async def openbio_gateway_tool(args):
+                        payload = openbio_api_tool(
+                            next_id(tool_name),
+                            tool_name,
+                            dict(args or {}),
+                        )
+                        return {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json.dumps(payload, ensure_ascii=False),
+                                }
+                            ]
+                        }
+
+                    return openbio_gateway_tool
+
+                openbio_tools.append(_register_openbio_tool())
+
         # Agent SDK custom tool registration is done through an in-process MCP server
         # config returned by create_sdk_mcp_server(..., tools=[...]).
         return create_sdk_mcp_server(
             name=self.SERVER_NAME,
             version="1.0.0",
-            tools=[run_pymol_command, capture_viewer_snapshot],
+            tools=[run_pymol_command, capture_viewer_snapshot] + openbio_tools,
         )
 
     async def _run_turn_async(
@@ -363,6 +457,7 @@ class ClaudeSdkLoop:
         should_cancel: Optional[Callable[[], bool]],
         run_command_tool: Callable[[str, Dict[str, Any]], Dict[str, Any]],
         snapshot_tool: Callable[[str, Dict[str, Any]], Dict[str, Any]],
+        openbio_api_tool: Optional[Callable[[str, str, Dict[str, Any]], Dict[str, Any]]] = None,
     ) -> SdkTurnResult:
         symbols = _import_sdk_symbols()
         ClaudeAgentOptions = symbols["ClaudeCodeOptions"]
@@ -379,6 +474,7 @@ class ClaudeSdkLoop:
             tool=tool,
             run_command_tool=run_command_tool,
             snapshot_tool=snapshot_tool,
+            openbio_api_tool=openbio_api_tool,
         )
 
         working_dir = os.path.realpath(os.getcwd())

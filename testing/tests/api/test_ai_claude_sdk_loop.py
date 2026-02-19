@@ -204,6 +204,53 @@ def test_build_tool_server_has_only_two_tools(monkeypatch):
     assert tool_names == {"run_pymol_command", "capture_viewer_snapshot"}
 
 
+def test_build_tool_server_adds_openbio_gateway_tools_when_callback_present(monkeypatch):
+    monkeypatch.setattr(sdk_loop_module, "_import_sdk_symbols", _symbols)
+    loop = ClaudeSdkLoop()
+    symbols = _symbols()
+
+    server = loop.build_tool_server(
+        create_sdk_mcp_server=symbols["create_sdk_mcp_server"],
+        tool=symbols["tool"],
+        run_command_tool=lambda _id, _args: {"ok": True},
+        snapshot_tool=lambda _id, _args: {"ok": True},
+        openbio_api_tool=lambda _id, _name, _args: {"ok": True},
+    )
+
+    tool_names = {getattr(t, "name", getattr(t, "__tool_name__", "")) for t in server["tools"]}
+    expected_openbio = {name for name, _, _ in sdk_loop_module.OPENBIO_GATEWAY_TOOL_SPECS}
+    assert {"run_pymol_command", "capture_viewer_snapshot"}.issubset(tool_names)
+    assert expected_openbio.issubset(tool_names)
+
+
+def test_openbio_gateway_tool_wrapper_forwards_name_and_args(monkeypatch):
+    monkeypatch.setattr(sdk_loop_module, "_import_sdk_symbols", _symbols)
+    loop = ClaudeSdkLoop()
+    symbols = _symbols()
+    calls = []
+
+    server = loop.build_tool_server(
+        create_sdk_mcp_server=symbols["create_sdk_mcp_server"],
+        tool=symbols["tool"],
+        run_command_tool=lambda _id, _args: {"ok": True},
+        snapshot_tool=lambda _id, _args: {"ok": True},
+        openbio_api_tool=lambda tool_id, tool_name, tool_args: calls.append((tool_id, tool_name, tool_args)) or {
+            "ok": True,
+            "tool_name": tool_name,
+        },
+    )
+
+    openbio_tool = next(t for t in server["tools"] if t.name == "openbio_api_list_tools")
+    result = asyncio.run(openbio_tool.handler({"category": "pubmed", "limit": 5}))
+    assert result["content"][0]["type"] == "text"
+    assert calls
+    call_id, tool_name, tool_args = calls[0]
+    assert call_id.startswith("openbio_api_list_tools_")
+    assert tool_name == "openbio_api_list_tools"
+    assert tool_args["category"] == "pubmed"
+    assert tool_args["limit"] == 5
+
+
 def test_run_turn_sets_bypass_permissions_and_allowed_tools(monkeypatch):
     monkeypatch.setattr(sdk_loop_module, "_import_sdk_symbols", _symbols)
 
