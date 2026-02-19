@@ -32,14 +32,23 @@ class AutoHeightTextBrowser(QtWidgets.QTextBrowser):
         self.setFrameShape(QtWidgets.QFrame.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setLineWrapMode(QtWidgets.QTextEdit.WidgetWidth)
+        self.setWordWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
         self.setOpenExternalLinks(True)
+        self.setMinimumWidth(0)
         self.document().setDocumentMargin(0)
+        self.document().setDefaultStyleSheet("pre, code { white-space: pre-wrap; }")
         self.document().contentsChanged.connect(self._sync_height)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._sync_height()
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(80)
+        return hint
 
     def _sync_height(self):
         width = max(100, self.viewport().width())
@@ -58,6 +67,8 @@ class MessageBubble(QtWidgets.QFrame):
 
         self.setObjectName("chatBubble")
         self.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
+        self.setMinimumWidth(0)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
@@ -65,11 +76,14 @@ class MessageBubble(QtWidgets.QFrame):
 
         self.title = QtWidgets.QLabel(title)
         self.title.setObjectName("chatBubbleTitle")
+        self.title.setWordWrap(True)
+        self.title.setMinimumWidth(0)
         layout.addWidget(self.title)
 
         self.body = AutoHeightTextBrowser()
         self.body.setObjectName("chatBubbleBody")
         self.body.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.AdjustToContents)
+        self.body.setMinimumWidth(0)
         layout.addWidget(self.body)
 
         palette = {
@@ -149,6 +163,8 @@ class ToolResultCard(QtWidgets.QFrame):
             self._tool_result_source = text
 
         self.setObjectName("toolResultCard")
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
+        self.setMinimumWidth(0)
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(4)
@@ -158,6 +174,7 @@ class ToolResultCard(QtWidgets.QFrame):
 
         summary = QtWidgets.QLabel("Executed: %s" % (self._tool_name,))
         summary.setWordWrap(True)
+        summary.setMinimumWidth(0)
         summary.setObjectName("toolResultSummary")
         header.addWidget(summary, 1)
 
@@ -302,6 +319,7 @@ class AssistantChatPanel(QtWidgets.QWidget):
         self._pending_reasoning_text = ""
         self._mode = "ai"
         self._max_visible_cards = self.MAX_VISIBLE_CARDS
+        self._agent_running = False
 
         self._ai_flush_timer = QtCore.QTimer(self)
         self._ai_flush_timer.setSingleShot(True)
@@ -335,6 +353,26 @@ class AssistantChatPanel(QtWidgets.QWidget):
         header.addWidget(self.stop_button)
 
         root.addLayout(header)
+
+        self.running_banner = QtWidgets.QFrame()
+        self.running_banner.setObjectName("chatRunningBanner")
+        running_layout = QtWidgets.QHBoxLayout(self.running_banner)
+        running_layout.setContentsMargins(8, 6, 8, 6)
+        running_layout.setSpacing(8)
+
+        self.running_label = QtWidgets.QLabel("PyMolAI is running...")
+        self.running_label.setObjectName("chatRunningLabel")
+        running_layout.addWidget(self.running_label, 0)
+
+        self.running_bar = QtWidgets.QProgressBar()
+        self.running_bar.setObjectName("chatRunningBar")
+        self.running_bar.setRange(0, 0)
+        self.running_bar.setTextVisible(False)
+        self.running_bar.setFixedHeight(6)
+        running_layout.addWidget(self.running_bar, 1)
+
+        self.running_banner.hide()
+        root.addWidget(self.running_banner, 0)
 
         self.scroll = QtWidgets.QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -381,13 +419,38 @@ class AssistantChatPanel(QtWidgets.QWidget):
             QPushButton {
                 padding: 4px 10px;
             }
+            QFrame#chatRunningBanner {
+                background: #13283a;
+                border: 1px solid #2f5878;
+                border-radius: 8px;
+            }
+            QLabel#chatRunningLabel {
+                color: #cfe7ff;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QProgressBar#chatRunningBar {
+                border: none;
+                background: #22364a;
+                border-radius: 3px;
+            }
+            QProgressBar#chatRunningBar::chunk {
+                background: #42a5f5;
+                border-radius: 3px;
+            }
             """
         )
 
     def sizeHint(self):
         return QtCore.QSize(340, 640)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_card_width_constraints()
+
     def _submit_from_input(self):
+        if self._agent_running:
+            return
         text = self.input_edit.toPlainText().strip()
         if not text:
             return
@@ -415,6 +478,15 @@ class AssistantChatPanel(QtWidgets.QWidget):
             self.input_edit.setPlaceholderText("CLI mode: type a PyMOL command (Enter to run, Shift+Enter newline)")
         else:
             self.input_edit.setPlaceholderText("Ask PyMolAI... (Enter to send, Shift+Enter newline)")
+
+    def set_agent_running(self, running: bool):
+        active = bool(running)
+        self._agent_running = active
+        self.running_banner.setVisible(active)
+        self.input_edit.setEnabled(not active)
+        self.send_button.setEnabled(not active)
+        if active and self.input_edit.hasFocus():
+            self.stop_button.setFocus()
 
     def clear_transcript(self):
         self._ai_flush_timer.stop()
@@ -587,6 +659,7 @@ class AssistantChatPanel(QtWidgets.QWidget):
 
     def _append_widget(self, widget: QtWidgets.QWidget):
         self.feed_layout.insertWidget(self.feed_layout.count() - 1, widget)
+        self._update_card_width_constraints()
         self._trim_transcript_widgets()
         self._scroll_to_bottom()
 
@@ -606,6 +679,18 @@ class AssistantChatPanel(QtWidgets.QWidget):
     def _scroll_to_bottom(self):
         bar = self.scroll.verticalScrollBar()
         QtCore.QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
+
+    def _update_card_width_constraints(self):
+        max_width = max(160, self.scroll.viewport().width() - 2)
+        for i in range(max(0, self.feed_layout.count() - 1)):
+            item = self.feed_layout.itemAt(i)
+            if item is None:
+                continue
+            widget = item.widget()
+            if widget is None:
+                continue
+            widget.setMinimumWidth(0)
+            widget.setMaximumWidth(max_width)
 
     def history_anchor_widget(self):
         return self.history_button

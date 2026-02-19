@@ -214,6 +214,11 @@ class AiRuntime:
     def current_agent_mode(self) -> str:
         return self.agent_mode
 
+    @property
+    def is_busy(self) -> bool:
+        with self._lock:
+            return bool(self._busy)
+
     @staticmethod
     def _log_value(value: object, max_len: int = 220) -> str:
         text = str(value).replace("\n", "\\n")

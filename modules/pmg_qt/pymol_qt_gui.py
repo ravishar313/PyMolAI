@@ -911,8 +911,10 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             if runtime.has_pending_ui_events():
                 next_feedback_ms = 0
             self.chat_panel.set_mode(runtime.current_input_mode)
+            self.chat_panel.set_agent_running(runtime.is_busy)
         else:
             self.chat_panel.set_mode("ai")
+            self.chat_panel.set_agent_running(False)
 
         feedback = self.cmd._get_feedback()
         if feedback:
@@ -958,6 +960,9 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self._chat_has_user_input = True
         self.doTypedCommand(text)
         self.pymolwidget._pymolProcess()
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            self.chat_panel.set_agent_running(runtime.is_busy)
         self.feedback_timer.start(0)
 
     def _on_chat_clear_requested(self):
