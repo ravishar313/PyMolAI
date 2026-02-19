@@ -15,14 +15,14 @@ from .state_snapshot import build_viewer_state_snapshot
 from .tool_execution import run_pymol_command
 from .vision_capture import capture_viewer_snapshot
 
-SYSTEM_PROMPT = """You are a PyMOL desktop agent.
+SYSTEM_PROMPT_BASE = """You are a PyMOL desktop agent.
 You can either:
 1) call tools to act in PyMOL, or
 2) provide a final direct answer without tool calls.
 
 Rules:
 - Use tool calls when an action/query in PyMOL is needed.
-- If tool results already answer the user, return a concise final answer and DO NOT call tools.
+- If tool results already answer the user, return a final direct answer and DO NOT call tools.
 - If you use terminal commands, run them only when required and only to support the user's request.
 - Always report terminal actions factually from tool output; do not claim actions that were not actually executed.
 - If external dependencies (like ffmpeg) are missing, state that limitation plainly and ask the user to install them.
@@ -36,7 +36,18 @@ Rules:
 - Do not repeat the same setup sentence or intent text step after step.
 - If a strategy fails repeatedly, switch approach or ask the user for clarification.
 - Do not re-run the same successful command in the same request unless you clearly explain why.
-- Keep answers concise and practical.
+"""
+
+SYSTEM_PROMPT_WORK_OVERLAY = """Mode: Work
+- Prioritize getting the requested work done end-to-end.
+- Keep narration concise while executing.
+- End with a concise summary of what you did and current result state.
+"""
+
+SYSTEM_PROMPT_TUTOR_OVERLAY = """Mode: Tutor
+- Teach as you work: explain what each command does and why it is used.
+- Briefly explain command syntax when relevant.
+- Prefer clear, instructional explanations over terse status updates.
 """
 
 _READ_ONLY_PREFIXES = (
@@ -76,7 +87,8 @@ class AiRuntime:
         self._log_to_python_logger = os.getenv("PYMOL_AI_LOGGER", "0") == "1"
         self.history: List[Dict[str, object]] = []
         self.model = os.getenv("PYMOL_AI_DEFAULT_MODEL") or DEFAULT_MODEL
-        self.reasoning_visible = False
+        self.reasoning_visible = _env_int("PYMOL_AI_REASONING_DEFAULT", 1) == 1
+        self.agent_mode = self._normalize_agent_mode(os.getenv("PYMOL_AI_AGENT_MODE") or "work")
         self.input_mode = "ai"
         self.final_answer_enabled = os.getenv("PYMOL_AI_FINAL_ANSWER", "1") != "0"
 
@@ -86,7 +98,7 @@ class AiRuntime:
         self.ui_event_batch = max(1, _env_int("PYMOL_AI_UI_EVENT_BATCH", 40))
         self.ui_max_events = max(0, _env_int("PYMOL_AI_UI_MAX_EVENTS", 2000))
         self.sdk_max_buffer_size = max(0, _env_int("PYMOL_AI_SDK_MAX_BUFFER_SIZE", 10 * 1024 * 1024))
-        self.trace_stream_chunks = _env_int("PYMOL_AI_TRACE_STREAM", 1) == 1
+        self.trace_stream_chunks = _env_int("PYMOL_AI_TRACE_STREAM", 0) == 1
 
         self.screenshot_width = _env_int("PYMOL_AI_SCREENSHOT_WIDTH", 1024)
         self.screenshot_height = _env_int("PYMOL_AI_SCREENSHOT_HEIGHT", 0)
@@ -112,6 +124,7 @@ class AiRuntime:
         self._agent_backend = "claude_sdk"
         self._sdk_session_id: Optional[str] = None
         self._sdk_loop = ClaudeSdkLoop(logger=self._log_ai)
+        self._sdk_loop.set_trace_stream(self.trace_stream_chunks)
         self._sdk_loop.map_openrouter_env()
         self._recent_tool_results: List[Dict[str, object]] = []
         self._log_ai(
@@ -119,6 +132,9 @@ class AiRuntime:
             enabled=self.enabled,
             input_mode=self.input_mode,
             model=self.model,
+            reasoning_visible=self.reasoning_visible,
+            agent_mode=self.agent_mode,
+            debug_mode=self.trace_stream_chunks,
             backend=self._agent_backend,
             api_key_set=bool(self._api_key),
         )
@@ -127,8 +143,23 @@ class AiRuntime:
     def _api_key(self) -> str:
         return (os.getenv("OPENROUTER_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN") or "").strip()
 
+    @staticmethod
+    def _normalize_agent_mode(mode: str) -> str:
+        return "tutor" if str(mode or "").strip().lower() == "tutor" else "work"
+
     def set_reasoning_visible(self, visible: bool) -> None:
         self.reasoning_visible = bool(visible)
+
+    def set_debug_mode(self, enabled: bool) -> None:
+        active = bool(enabled)
+        self.trace_stream_chunks = active
+        self._sdk_loop.set_trace_stream(active)
+        self._log_ai("debug mode changed", enabled=active)
+
+    def set_agent_mode(self, mode: str) -> None:
+        normalized = self._normalize_agent_mode(mode)
+        self.agent_mode = normalized
+        self._log_ai("agent mode changed", mode=normalized)
 
     def set_ui_mode(self, mode: str) -> None:
         self._ui_mode = mode if mode in ("qt", "text") else "text"
@@ -136,6 +167,10 @@ class AiRuntime:
     @property
     def current_input_mode(self) -> str:
         return self.input_mode
+
+    @property
+    def current_agent_mode(self) -> str:
+        return self.agent_mode
 
     @staticmethod
     def _log_value(value: object, max_len: int = 220) -> str:
@@ -202,6 +237,8 @@ class AiRuntime:
                 "model": self.model,
                 "enabled": bool(self.enabled),
                 "reasoning_visible": bool(self.reasoning_visible),
+                "debug_mode": bool(self.trace_stream_chunks),
+                "agent_mode": self.current_agent_mode,
                 "final_answer_enabled": bool(self.final_answer_enabled),
             },
         }
@@ -223,22 +260,30 @@ class AiRuntime:
         else:
             self.history = []
 
-        if apply_model:
-            model_info = payload.get("model_info") or {}
-            if isinstance(model_info, dict):
+        model_info = payload.get("model_info") or {}
+        if isinstance(model_info, dict):
+            if "reasoning_visible" in model_info:
+                self.set_reasoning_visible(bool(model_info.get("reasoning_visible")))
+            if "debug_mode" in model_info:
+                self.set_debug_mode(bool(model_info.get("debug_mode")))
+            if "agent_mode" in model_info:
+                self.set_agent_mode(str(model_info.get("agent_mode") or "work"))
+
+            if apply_model:
                 model = str(model_info.get("model") or "").strip()
                 if model:
                     self.model = model
                 if "enabled" in model_info:
                     self.enabled = bool(model_info.get("enabled"))
-                if "reasoning_visible" in model_info:
-                    self.reasoning_visible = bool(model_info.get("reasoning_visible"))
         self._log_ai(
             "session state imported",
             apply_model=apply_model,
             input_mode=self.input_mode,
             history_len=len(self.history),
             sdk_session_id=bool(self._sdk_session_id),
+            reasoning_visible=self.reasoning_visible,
+            agent_mode=self.agent_mode,
+            debug_mode=self.trace_stream_chunks,
             enabled=self.enabled,
         )
 
@@ -480,6 +525,11 @@ class AiRuntime:
             )
         )
 
+    def _build_system_prompt(self) -> str:
+        mode = self._normalize_agent_mode(self.agent_mode)
+        overlay = SYSTEM_PROMPT_TUTOR_OVERLAY if mode == "tutor" else SYSTEM_PROMPT_WORK_OVERLAY
+        return SYSTEM_PROMPT_BASE + "\n" + overlay
+
     def _build_turn_prompt(self, prompt: str, *, include_history_context: bool) -> str:
         state_summary = self._state_summary_for_prompt()
         lines = [
@@ -614,6 +664,20 @@ class AiRuntime:
     @staticmethod
     def _normalized_command_key(command: str) -> str:
         return re.sub(r"\s+", " ", str(command or "").strip().lower())
+
+    @staticmethod
+    def _normalize_sdk_tool_name(raw_name: str) -> Tuple[str, str]:
+        name = str(raw_name or "").strip()
+        if not name:
+            return "", ""
+        # Claude Agent SDK MCP tool names can come back as:
+        # mcp__<server_name>__<tool_name>
+        if name.startswith("mcp__"):
+            parts = name.split("__")
+            if len(parts) >= 3 and parts[-1]:
+                canonical = parts[-1].strip()
+                return canonical, canonical
+        return name, name
 
     def _execute_snapshot_tool(self) -> Tuple[Dict[str, object], Optional[str], Dict[str, object]]:
         capture = self._run_in_gui(
@@ -808,8 +872,17 @@ class AiRuntime:
                 tool_output: object,
                 tool_error_flag: Optional[bool],
             ) -> None:
-                normalized = str(tool_name or "").strip()
+                raw_tool_name = str(tool_name or "").strip()
+                canonical_name, display_name = self._normalize_sdk_tool_name(raw_tool_name)
+                normalized = canonical_name or raw_tool_name
                 if normalized in ("run_pymol_command", "capture_viewer_snapshot"):
+                    self._log_ai(
+                        "ignored mirrored internal mcp tool result",
+                        level="DEBUG",
+                        tool_call_id=tool_call_id,
+                        tool_name_raw=raw_tool_name,
+                        canonical_name=normalized,
+                    )
                     return
 
                 args_payload = dict(tool_args or {})
@@ -817,12 +890,12 @@ class AiRuntime:
                 if normalized == "Bash":
                     command = str(args_payload.get("command") or "").strip()
                 if not command:
-                    command = normalized or "tool"
+                    command = display_name or normalized or "tool"
 
                 ok = not bool(tool_error_flag)
                 payload = {
                     "ok": ok,
-                    "tool_name": normalized or "tool",
+                    "tool_name": display_name or normalized or "tool",
                     "tool_args": args_payload,
                     "result": tool_output,
                     "is_error": bool(tool_error_flag),
@@ -831,7 +904,8 @@ class AiRuntime:
                 self._log_ai(
                     "external tool result",
                     tool_call_id=tool_call_id,
-                    tool_name=normalized or "tool",
+                    tool_name=display_name or normalized or "tool",
+                    tool_name_raw=raw_tool_name,
                     command=command,
                     ok=ok,
                 )
@@ -842,7 +916,8 @@ class AiRuntime:
                         ok=ok,
                         metadata={
                             "tool_call_id": tool_call_id or "external_tool",
-                            "tool_name": normalized or "tool",
+                            "tool_name": display_name or normalized or "tool",
+                            "tool_name_raw": raw_tool_name or None,
                             "tool_args": args_payload,
                             "tool_command": command if normalized == "Bash" else None,
                             "tool_result_json": self._tool_result_metadata_payload(payload),
@@ -857,7 +932,7 @@ class AiRuntime:
                     {
                         "role": "tool",
                         "tool_call_id": tool_call_id or "external_tool",
-                        "name": normalized or "tool",
+                        "name": display_name or normalized or "tool",
                         "content": content,
                     }
                 )
@@ -866,7 +941,7 @@ class AiRuntime:
                 return self._sdk_loop.run_turn(
                     prompt=request_prompt,
                     model=self.model,
-                    system_prompt=SYSTEM_PROMPT,
+                    system_prompt=self._build_system_prompt(),
                     max_turns=self.max_agent_steps,
                     resume_session_id=resume_session_id,
                     on_text_chunk=self._on_assistant_chunk,

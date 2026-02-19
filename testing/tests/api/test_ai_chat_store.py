@@ -41,7 +41,12 @@ def test_create_bundle_append_and_checkpoint(tmp_path):
         {
             "input_mode": "ai",
             "history": [{"role": "user", "content": "show aspirin"}],
-            "model_info": {"model": "openai/test"},
+            "model_info": {
+                "model": "openai/test",
+                "reasoning_visible": True,
+                "debug_mode": False,
+                "agent_mode": "tutor",
+            },
         },
     )
     store.mark_scene_dirty(chat_id, reason="command_ok")
@@ -54,6 +59,10 @@ def test_create_bundle_append_and_checkpoint(tmp_path):
     assert len(payload["events"]) == 2
     assert payload["manifest"]["runtime_state"]["input_mode"] == "ai"
     assert payload["manifest"]["runtime_state"]["backend"] == "claude_sdk"
+    model_info = payload["manifest"]["runtime_state"]["model_info"]
+    assert model_info["reasoning_visible"] is True
+    assert model_info["debug_mode"] is False
+    assert model_info["agent_mode"] == "tutor"
 
 
 def test_list_search_and_pagination(tmp_path):

@@ -935,6 +935,16 @@ class PyMOLDesktopGUI(object):
         if runtime is not None:
             runtime.set_reasoning_visible(bool(visible))
 
+    def set_ai_debug_mode(self, visible):
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            runtime.set_debug_mode(bool(visible))
+
+    def set_ai_agent_mode(self, mode):
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            runtime.set_agent_mode(str(mode))
+
     def back_search(self, set0=False):
         '''Command line history back search'''
         if not self.history_cur or set0:

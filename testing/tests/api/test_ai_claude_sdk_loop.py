@@ -171,6 +171,16 @@ def test_map_openrouter_env(monkeypatch):
     assert env["ANTHROPIC_API_KEY"] == ""
 
 
+def test_trace_stream_default_off_and_setter(monkeypatch):
+    monkeypatch.delenv("PYMOL_AI_TRACE_STREAM", raising=False)
+    loop = ClaudeSdkLoop()
+    assert loop._trace_stream is False
+    loop.set_trace_stream(True)
+    assert loop._trace_stream is True
+    loop.set_trace_stream(False)
+    assert loop._trace_stream is False
+
+
 def test_build_tool_server_has_only_two_tools(monkeypatch):
     monkeypatch.setattr(sdk_loop_module, "_import_sdk_symbols", _symbols)
     loop = ClaudeSdkLoop()

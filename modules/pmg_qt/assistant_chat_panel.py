@@ -210,6 +210,10 @@ class ToolResultCard(QtWidgets.QFrame):
         if command:
             return command
         tool_name = str(metadata.get("tool_name") or "").strip()
+        if tool_name.startswith("mcp__"):
+            parts = tool_name.split("__")
+            if len(parts) >= 3 and parts[-1].strip():
+                tool_name = parts[-1].strip()
         if tool_name:
             return tool_name
         if tool_label:

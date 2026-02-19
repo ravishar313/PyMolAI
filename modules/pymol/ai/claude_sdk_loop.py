@@ -216,7 +216,10 @@ class ClaudeSdkLoop:
     def __init__(self, logger: Optional[Callable[..., None]] = None):
         self._log_fn = logger
         self._logger = logging.getLogger("pymol.ai.sdk")
-        self._trace_stream = os.getenv("PYMOL_AI_TRACE_STREAM", "1") == "1"
+        self._trace_stream = os.getenv("PYMOL_AI_TRACE_STREAM", "0") == "1"
+
+    def set_trace_stream(self, enabled: bool) -> None:
+        self._trace_stream = bool(enabled)
 
     def _log(self, message: str, level: str = "INFO", **fields) -> None:
         if self._log_fn:
