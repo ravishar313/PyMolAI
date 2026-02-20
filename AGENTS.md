@@ -20,32 +20,51 @@ Core points:
 
 ## 3) Agent-Safe Setup Scripts
 
+### macOS prerequisites (Homebrew)
+
+The C++ extension requires native libraries not bundled in the Python package.
+Install them before the pip/uv install step:
+
+```bash
+brew install netcdf glew glm
+# libxml2, freetype, and libpng are typically already present;
+# install them too if the build fails looking for those headers.
+```
+
 ## macOS
 
 ```bash
 cd /path/to/pymol
-python3 -m venv .venv
+# Create venv with uv (Python 3.10+ for full claude-agent-sdk support)
+uv venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install .
-python -c "import keyring, openai; print('ok: keyring/openai')"
-python -c "import claude_agent_sdk; print('ok: claude-agent-sdk')"
-# Maintainer-tested reinstall form:
-source .venv/bin/activate && PREFIX_PATH=/opt/homebrew:/opt/homebrew/opt/libxml2 uv pip install --python .venv/bin/python --reinstall .
+
+# Build and install — include netcdf in PREFIX_PATH alongside homebrew paths
+PREFIX_PATH=/opt/homebrew:/opt/homebrew/opt/libxml2:/opt/homebrew/opt/netcdf \
+  uv pip install --python .venv/bin/python --reinstall .
+
+# PyQt5 must be installed explicitly. PyQt6 is also detected by PyMOL's Qt
+# loader but has incompatible enum namespacing with this codebase.
+uv pip install --python .venv/bin/python PyQt5
+
+# Verify
+.venv/bin/python -c "import keyring, openai; print('ok: keyring/openai')"
+.venv/bin/python -c "import claude_agent_sdk; print('ok: claude-agent-sdk')"
+.venv/bin/python -c "from PyQt5 import QtWidgets; print('ok: PyQt5')"
 ```
 
 ## Windows (PowerShell)
 
 ```powershell
 cd C:\path\to\pymol
-py -3.10 -m venv .venv
+uv venv .venv --python 3.10
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install .
+$env:PREFIX_PATH = "C:\path\to\deps"
+uv pip install --python .venv\Scripts\python.exe --reinstall .
+uv pip install --python .venv\Scripts\python.exe PyQt5
 python -c "import keyring, openai; print('ok: keyring/openai')"
 python -c "import claude_agent_sdk; print('ok: claude-agent-sdk')"
-# Optional uv reinstall form:
-$env:PREFIX_PATH = "C:\path\to\deps"; uv pip install --python .venv\Scripts\python.exe --reinstall .
+python -c "from PyQt5 import QtWidgets; print('ok: PyQt5')"
 ```
 
 ## 4) Provider/Key Behavior
@@ -100,6 +119,21 @@ Key storage:
 ## E) Keychain unavailable
 - Install/configure OS keychain backend for `keyring`.
 - If unavailable, use env vars as temporary fallback.
+
+## F) macOS build fails: `netcdf.h` not found
+- Run: `brew install netcdf`
+- Add `/opt/homebrew/opt/netcdf` to `PREFIX_PATH` in the install command.
+
+## G) macOS build fails: `GL/glew.h` not found
+- Run: `brew install glew glm`
+- `/opt/homebrew` in `PREFIX_PATH` covers these; ensure it is present.
+
+## H) PyMOL crashes on launch: `AttributeError: type object 'Qt' has no attribute '...'`
+- Cause: PyQt6 is installed but PyQt5 is not. PyMOL falls back to PyQt6 when PyQt5
+  is absent, but the chat UI code uses PyQt5-style flat enum access which is
+  incompatible with PyQt6's namespaced enums.
+- Fix: `uv pip install --python .venv/bin/python PyQt5`
+- PyMOL's Qt loader tries PyQt5 first; once installed it will be selected automatically.
 
 ## 7) Support Boundaries and Safety
 

@@ -42,45 +42,59 @@ PyMolAI chat UI is designed for Qt desktop usage (`pmg_qt`).
 
 ## Installation Quickstarts
 
-## macOS (source install in virtualenv)
+## macOS (source install with uv)
+
+### Step 1 — Install system dependencies (Homebrew)
+
+The C++ build requires several native libraries. Install them before building:
+
+```bash
+brew install netcdf glew glm
+```
+
+`libxml2` and `freetype` are typically already present via Homebrew. If the build still fails, install them too:
+
+```bash
+brew install libxml2 freetype libpng
+```
+
+### Step 2 — Create virtualenv and install
+
+Use `uv` (recommended):
 
 ```bash
 cd /path/to/pymol
-python3 -m venv .venv
+uv venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install .
+PREFIX_PATH=/opt/homebrew:/opt/homebrew/opt/libxml2:/opt/homebrew/opt/netcdf uv pip install --python .venv/bin/python --reinstall .
 ```
 
-Maintainer-tested command (Homebrew/libxml2 environment):
+### Step 3 — Install PyQt5
+
+PyMOL's Qt GUI layer must use **PyQt5**. PyQt6 is detected later in the fallback chain but has enum API incompatibilities with this codebase. Install PyQt5 explicitly:
 
 ```bash
-source .venv/bin/activate && PREFIX_PATH=/opt/homebrew:/opt/homebrew/opt/libxml2 uv pip install --python .venv/bin/python --reinstall .
+uv pip install --python .venv/bin/python PyQt5
 ```
 
-Optional import verification:
+### Step 4 — Verify imports
 
 ```bash
-python -c "import keyring, openai; print('ok: keyring/openai')"
-python -c "import claude_agent_sdk; print('ok: claude-agent-sdk')"
+.venv/bin/python -c "import keyring, openai; print('ok: keyring/openai')"
+.venv/bin/python -c "import claude_agent_sdk; print('ok: claude-agent-sdk')"
+.venv/bin/python -c "from PyQt5 import QtWidgets; print('ok: PyQt5')"
 ```
 
 If `claude_agent_sdk` import fails, verify the interpreter is Python 3.10+.
 
-## Windows (PowerShell, source install in virtualenv)
+## Windows (PowerShell, source install with uv)
 
 ```powershell
 cd C:\path\to\pymol
-py -3.10 -m venv .venv
+uv venv .venv --python 3.10
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install .
-```
-
-If using `uv` on Windows, use the equivalent activated-venv command:
-
-```powershell
 $env:PREFIX_PATH = "C:\path\to\deps"; uv pip install --python .venv\Scripts\python.exe --reinstall .
+uv pip install --python .venv\Scripts\python.exe PyQt5
 ```
 
 Optional import verification:
@@ -88,6 +102,7 @@ Optional import verification:
 ```powershell
 python -c "import keyring, openai; print('ok: keyring/openai')"
 python -c "import claude_agent_sdk; print('ok: claude-agent-sdk')"
+python -c "from PyQt5 import QtWidgets; print('ok: PyQt5')"
 ```
 
 ## First-Run Setup
@@ -166,6 +181,43 @@ Cause:
 
 Action:
 - Use Python 3.10+ for full PyMolAI agent behavior.
+
+## PyMOL Crashes on Launch with AttributeError in Qt Enums
+
+Symptom:
+- `AttributeError: type object 'Qt' has no attribute 'ScrollBarAlwaysOff'` (or similar enum errors).
+
+Cause:
+- PyQt6 is installed but not PyQt5. PyMOL detects PyQt6 as a fallback, but the GUI code uses PyQt5-style flat enum access (`Qt.ScrollBarAlwaysOff`) which was namespaced in PyQt6 (`Qt.ScrollBarPolicy.ScrollBarAlwaysOff`).
+
+Action:
+- Install PyQt5 explicitly. PyMOL's Qt detection tries PyQt5 first, so it will be used instead of PyQt6:
+  ```bash
+  uv pip install --python .venv/bin/python PyQt5
+  ```
+
+## macOS Build Fails: `netcdf.h` not found
+
+Symptom:
+- Build error: `fatal error: 'netcdf.h' file not found`
+
+Action:
+- Install netcdf via Homebrew and add it to PREFIX_PATH:
+  ```bash
+  brew install netcdf
+  PREFIX_PATH=/opt/homebrew:/opt/homebrew/opt/libxml2:/opt/homebrew/opt/netcdf uv pip install ...
+  ```
+
+## macOS Build Fails: `GL/glew.h` not found
+
+Symptom:
+- Build error: `fatal error: 'GL/glew.h' file not found`
+
+Action:
+- Install GLEW and GLM via Homebrew:
+  ```bash
+  brew install glew glm
+  ```
 
 ## OpenBio Unavailable but OpenRouter Works
 
