@@ -1,3 +1,82 @@
+----------------------------------------------------------------------
+PyMolAI QUICK INSTALL (macOS / Windows)
+----------------------------------------------------------------------
+
+This section documents the PyMolAI-focused setup path. The existing
+compilation/install guidance below remains valid.
+
+QUICK REQUIREMENTS
+
+    - Python 3.10+ recommended for full PyMolAI agent features
+      (package itself supports Python 3.9+, but claude-agent-sdk is 3.10+)
+    - pip + virtualenv
+    - Qt desktop GUI build for chat panel usage
+    - Internet access for OpenRouter and (optional) OpenBio API calls
+
+AI-RELATED PYTHON DEPENDENCIES
+
+    - openai>=1.0.0
+    - keyring>=24
+    - claude-agent-sdk>=0.1.38 (Python 3.10+)
+
+macOS QUICK PATH
+
+    cd /path/to/pymol
+    python3 -m venv .venv
+    source .venv/bin/activate
+    python -m pip install --upgrade pip setuptools wheel
+    python -m pip install .
+
+    Optional dependency checks:
+    python -c "import keyring, openai; print('ok')"
+    python -c "import claude_agent_sdk; print('ok')"
+
+    Maintainer-tested reinstall command:
+    source .venv/bin/activate && PREFIX_PATH=/opt/homebrew:/opt/homebrew/opt/libxml2 uv pip install --python .venv/bin/python --reinstall .
+
+Windows (PowerShell) QUICK PATH
+
+    cd C:\path\to\pymol
+    py -3.10 -m venv .venv
+    .\.venv\Scripts\Activate.ps1
+    python -m pip install --upgrade pip setuptools wheel
+    python -m pip install .
+
+    Optional dependency checks:
+    python -c "import keyring, openai; print('ok')"
+    python -c "import claude_agent_sdk; print('ok')"
+
+    Optional uv reinstall form:
+    $env:PREFIX_PATH = "C:\path\to\deps"; uv pip install --python .venv\Scripts\python.exe --reinstall .
+
+KEY SETUP IN APP
+
+    Open these menus in the PyMOL GUI:
+      Display -> PyMolAI Settings -> OpenRouter API Key...
+      Display -> PyMolAI Settings -> OpenBio API Key...
+
+    Notes:
+      - OpenRouter key is required for AI mode.
+      - OpenBio key is optional and only enables OpenBio gateway tools.
+      - Keys can be saved to the OS keychain (via keyring).
+
+VERIFICATION CHECKLIST
+
+    - Launch PyMOL
+    - Open PyMolAI chat panel
+    - Confirm both API key dialogs exist under "PyMolAI Settings"
+    - Validate OpenRouter key (AI should run)
+    - Validate OpenBio key (OpenBio tools should be available)
+    - Clear OpenBio key and verify only OpenBio tools disappear
+
+TROUBLESHOOTING QUICK NOTES
+
+    - Keychain unavailable: configure OS credential store backend
+    - OpenBio blocked/auth errors: verify OPENBIO_API_KEY/network/base URL
+    - Missing claude-agent-sdk: use Python 3.10+
+
+----------------------------------------------------------------------
+
 
 ----------------------------------------------------------------------
 INSTALLATION VIA COMPILATION
