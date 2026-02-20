@@ -10,15 +10,19 @@ import sys
 
 import pymol
 import pymol._gui
-from pymol import colorprinting, save_shortcut
+from pymol import save_shortcut
 
 from pymol.Qt import QtGui, QtCore, QtWidgets
-from pymol.Qt.utils import (getSaveFileNameWithExt, UpdateLock, WidgetMenu,
+from pymol.Qt.utils import (getSaveFileNameWithExt, UpdateLock,
         MainThreadCaller,
         PopupOnException,
-        connectFontContextMenu, getMonospaceFont)
+        )
+from pymol.ai.message_types import UiEvent, UiRole
 
 from .pymol_gl_widget import PyMOLGLWidget
+from .assistant_chat_panel import AssistantChatPanel
+from .ai_chat_store import AiChatStore
+from .ai_chat_history_popup import ChatHistoryPopup, ChatHistoryManagerDialog
 from . import keymapping
 
 from pmg_qt import properties_dialog, file_dialogs
@@ -54,6 +58,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             self.pymolwidget.pymol.button(*args)
 
     def closeEvent(self, event):
+        if getattr(self, "_chat_store", None) is not None:
+            self._chat_store.close()
         self.cmd.quit()
 
     # for thread-safe viewport command
@@ -93,8 +99,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         # resize Window before it is shown
         options = pymol.invocation.options
         self.resize(
-            options.win_x + (220 if options.internal_gui else 0),
-            options.win_y + (246 if options.external_gui else 18))
+            options.win_x + (220 if options.internal_gui else 0) + (340 if options.external_gui else 0),
+            options.win_y + 18)
 
         # for thread-safe viewport command
         self.viewportsignal.connect(self.pymolviewport)
@@ -106,6 +112,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.builder = None
         self.shortcut_menu_filter_dialog = None
         self.scene_panel_dialog = None
+        self.ai_api_key_dialog = None
 
         # setting index -> callable
         self.setting_callbacks = defaultdict(list)
@@ -115,99 +122,43 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             lambda v: self.setWindowTitle("PyMOL (" + os.path.basename(v) + ")")
         )
 
-        # "External" Command Line and Loggin Widget
+        # assistant chat state + command history
         self._setup_history()
-        self.lineedit = CommandLineEdit()
-        self.lineedit.setObjectName("command_line")
-        self.browser = QtWidgets.QPlainTextEdit()
-        self.browser.setObjectName("feedback_browser")
-        self.browser.setReadOnly(True)
+        self.chat_panel = AssistantChatPanel(self)
+        self.chat_panel.sendCommand.connect(self._on_chat_command_submitted)
+        self.chat_panel.clearRequested.connect(self._on_chat_clear_requested)
+        self.chat_panel.stopRequested.connect(self._on_chat_stop_requested)
+        self.chat_panel.historyRequested.connect(self._on_chat_history_requested)
+        self.chat_panel.newChatRequested.connect(self._on_chat_new_requested)
+        self._chat_has_user_input = False
+        self._history_manager_dialog = None
+        self.lineedit = self.chat_panel.input_edit
 
-        # convenience: clicking into feedback browser gives focus to command
-        # line. Drawback: Copying with CTRL+C doesn't work in feedback
-        # browser -> clear focus proxy while text selected
-        self.browser.setFocusProxy(self.lineedit)
+        self._history_popup = ChatHistoryPopup(self._list_chat_rows, self)
+        self._history_popup.chatSelected.connect(self._on_history_chat_selected)
+        self._history_popup.managerRequested.connect(self._open_history_manager)
 
-        @self.browser.copyAvailable.connect
-        def _(yes):
-            self.browser.setFocusProxy(None if yes else self.lineedit)
-            self.browser.setFocus()
-
-        # Font
-        self.browser.setFont(getMonospaceFont())
-        connectFontContextMenu(self.browser)
-
-        lineeditlayout = QtWidgets.QHBoxLayout()
-        command_label = QtWidgets.QLabel("PyMOL>")
-        command_label.setObjectName("command_label")
-        lineeditlayout.addWidget(command_label)
-        lineeditlayout.addWidget(self.lineedit)
-        self.lineedit.setToolTip('''Command Input Area
-
-Get the list of commands by hitting <TAB>
-
-Get the list of arguments for one command with a question mark:
-PyMOL> color ?
-
-Read the online help for a command with "help":
-PyMOL> help color
-
-Get autocompletion for many arguments by hitting <TAB>
-PyMOL> color ye<TAB>    (will autocomplete "yellow")
-''')
-
-        layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.browser)
-        layout.addLayout(lineeditlayout)
-
-        quickbuttonslayout = QtWidgets.QVBoxLayout()
-        quickbuttonslayout.setSpacing(2)
-
-        extguilayout = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.LeftToRight)
-        extguilayout.setContentsMargins(2, 2, 2, 2)
-        extguilayout.addLayout(layout)
-        extguilayout.addLayout(quickbuttonslayout)
-
-        class ExtGuiFrame(QtWidgets.QFrame):
-            def mouseDoubleClickEvent(_, event):
-                self.toggle_ext_window_dockable(True)
-
-            _size_hint = QtCore.QSize(options.win_x, options.ext_y)
-
-            def sizeHint(self):
-                return self._size_hint
-
-        dockWidgetContents = ExtGuiFrame(self)
-        dockWidgetContents.setLayout(extguilayout)
-        dockWidgetContents.setObjectName("extgui")
-
-        self.ext_window = \
-            dockWidget = QtWidgets.QDockWidget(self)
-        dockWidget.setWindowTitle("External GUI")
-        dockWidget.setWidget(dockWidgetContents)
+        self.ext_window = dockWidget = QtWidgets.QDockWidget(self)
+        dockWidget.setObjectName("assistant_chat_dock")
+        dockWidget.setWindowTitle("PyMolAI")
+        dockWidget.setWidget(self.chat_panel)
+        dockWidget.setAllowedAreas(Qt.LeftDockWidgetArea)
+        dockWidget.setFeatures(QtWidgets.QDockWidget.DockWidgetClosable)
+        dockWidget.resize(340, options.win_y)
         if options.external_gui:
-            dockWidget.setTitleBarWidget(QtWidgets.QWidget())
+            dockWidget.show()
         else:
             dockWidget.hide()
 
-        self.addDockWidget(Qt.TopDockWidgetArea, dockWidget)
-
-        # rearrange vertically if docking left or right
-        @dockWidget.dockLocationChanged.connect
-        def _(area):
-            if area == Qt.LeftDockWidgetArea or area == Qt.RightDockWidgetArea:
-                extguilayout.setDirection(QtWidgets.QBoxLayout.BottomToTop)
-                quickbuttonslayout.takeAt(quickbuttons_stretch_index)
-            else:
-                extguilayout.setDirection(QtWidgets.QBoxLayout.LeftToRight)
-                if quickbuttons_stretch_index >= quickbuttonslayout.count():
-                    quickbuttonslayout.addStretch()
+        self.addDockWidget(Qt.LeftDockWidgetArea, dockWidget)
 
         # OpenGL Widget
         self.pymolwidget = PyMOLGLWidget(self)
         self.setCentralWidget(self.pymolwidget)
 
         cmd = self.cmd = self.pymolwidget.cmd
+        self._chat_store = AiChatStore()
+        self._start_new_chat_session(title_hint="")
 
         '''
         # command completion
@@ -215,76 +166,8 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
         self.lineedit.setCompleter(completer)
         '''
 
-        # overload <Tab> action
-        self.lineedit.installEventFilter(self)
+        # overload <Tab> action for viewport controls
         self.pymolwidget.installEventFilter(self)
-
-        # Quick Buttons
-        for row in [
-            [
-                ('Reset', cmd.reset),
-                ('Zoom', lambda: cmd.zoom(animate=1.0)),
-                ('Orient', lambda: cmd.orient(animate=1.0)),
-
-                # render dialog will be constructed when the menu is shown
-                # for the first time. This way it's populated with the current
-                # viewport and settings. Also defers parsing of the ui file.
-                ('Draw/Ray', WidgetMenu(self).setSetupUi(self.render_dialog)),
-            ],
-            [
-                ('Unpick', cmd.unpick),
-                ('Deselect', cmd.deselect),
-                ('Rock', cmd.rock),
-                ('Get View', self.get_view),
-            ],
-            [
-                ('|<', cmd.rewind),
-                ('<', cmd.backward),
-                ('Stop', cmd.mstop),
-                ('Play', cmd.mplay),
-                ('>', cmd.forward),
-                ('>|', cmd.ending),
-                ('MClear', cmd.mclear),
-            ],
-            [
-                ('Builder', self.open_builder_panel),
-                ('Properties', self.open_props_dialog),
-                ('Rebuild', cmd.rebuild),
-            ],
-        ]:
-            hbox = QtWidgets.QHBoxLayout()
-            hbox.setSpacing(2)
-
-            for name, callback in row:
-                btn = QtWidgets.QPushButton(name)
-                btn.setProperty("quickbutton", True)
-                btn.setAttribute(Qt.WA_LayoutUsesWidgetRect) # OS X workaround
-                hbox.addWidget(btn)
-
-                if callback is None:
-                    btn.setEnabled(False)
-                elif isinstance(callback, QtWidgets.QMenu):
-                    btn.setMenu(callback)
-                else:
-                    btn.released.connect(callback)
-
-            quickbuttonslayout.addLayout(hbox)
-
-        # progress bar
-        hbox = QtWidgets.QHBoxLayout()
-        self.progressbar = QtWidgets.QProgressBar()
-        self.progressbar.setSizePolicy(
-                QtWidgets.QSizePolicy.Minimum,
-                QtWidgets.QSizePolicy.Minimum)
-        hbox.addWidget(self.progressbar)
-        self.abortbutton = QtWidgets.QPushButton('Abort')
-        self.abortbutton.setStyleSheet("background: #FF0000; color: #FFFFFF")
-        self.abortbutton.released.connect(cmd.interrupt)
-        hbox.addWidget(self.abortbutton)
-        quickbuttonslayout.addLayout(hbox)
-
-        quickbuttonslayout.addStretch()
-        quickbuttons_stretch_index = quickbuttonslayout.count() - 1
 
         # menu top level
         self.menubar = menubar = self.menuBar()
@@ -373,15 +256,48 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
                             fname if len(fname) < 128 else '...' + fname[-120:],
                             lambda fname=fname: self.load_dialog(fname))
 
-        # some experimental window control
+        # assistant chat controls
         menu = self.menudict['Display'].addSeparator()
-        menu = self.menudict['Display'].addMenu('External GUI')
-        menu.addAction('Toggle dockable', self.toggle_ext_window_dockable).setShortcut(
-            QtGui.QKeySequence('Ctrl+E'))
+        menu = self.menudict['Display'].addMenu('PyMolAI')
 
         ext_vis_action = self.ext_window.toggleViewAction()
         ext_vis_action.setText('Visible')
         menu.addAction(ext_vis_action)
+        menu.addAction('Focus Input', self.chat_panel.focus_input).setShortcut(
+            QtGui.QKeySequence('Ctrl+E'))
+
+        ai_menu = self.menudict['Display'].addMenu('PyMolAI Settings')
+        self.ai_reasoning_action = ai_menu.addAction('Show Reasoning')
+        self.ai_reasoning_action.setCheckable(True)
+
+        self.ai_debug_action = ai_menu.addAction('Debug Mode')
+        self.ai_debug_action.setCheckable(True)
+
+        self.ai_api_key_action = ai_menu.addAction('OpenRouter API Key...')
+        self.ai_openbio_api_key_action = ai_menu.addAction('OpenBio API Key...')
+
+        ai_mode_menu = ai_menu.addMenu('Assistant Mode')
+        self.ai_mode_action_group = QtWidgets.QActionGroup(self)
+        self.ai_mode_action_group.setExclusive(True)
+        self.ai_mode_work_action = ai_mode_menu.addAction('Work')
+        self.ai_mode_work_action.setCheckable(True)
+        self.ai_mode_tutor_action = ai_mode_menu.addAction('Tutor')
+        self.ai_mode_tutor_action.setCheckable(True)
+        self.ai_mode_action_group.addAction(self.ai_mode_work_action)
+        self.ai_mode_action_group.addAction(self.ai_mode_tutor_action)
+
+        runtime = self.get_ai_runtime(create=True)
+        if runtime is not None:
+            runtime.set_ui_mode('qt')
+        self._sync_ai_settings_menu_from_runtime()
+        self._persist_runtime_state_now()
+
+        self.ai_reasoning_action.toggled.connect(self.set_ai_reasoning_visible)
+        self.ai_debug_action.toggled.connect(self.set_ai_debug_mode)
+        self.ai_api_key_action.triggered.connect(self._open_ai_api_key_dialog)
+        self.ai_openbio_api_key_action.triggered.connect(self._open_ai_openbio_api_key_dialog)
+        self.ai_mode_work_action.toggled.connect(lambda checked: checked and self.set_ai_agent_mode('work'))
+        self.ai_mode_tutor_action.toggled.connect(lambda checked: checked and self.set_ai_agent_mode('tutor'))
 
         # extra key mappings (MacPyMOL compatible)
         QtWidgets.QShortcut(QtGui.QKeySequence('Ctrl+O'), self).activated.connect(self.file_open)
@@ -399,7 +315,7 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
 
         # focus in command line
         if options.external_gui:
-            self.lineedit.setFocus()
+            self.chat_panel.focus_input()
         else:
             self.pymolwidget.setFocus()
 
@@ -418,56 +334,26 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
         # Load saved shortcuts on launch
         self.saved_shortcuts = pymol.save_shortcut.load_and_set(self.cmd)
 
-    def lineeditKeyPressEventFilter(self, watched, event):
-        key = event.key()
-        if key == Qt.Key_Tab:
-            self.complete()
-        elif key == Qt.Key_Up:
-            if event.modifiers() & Qt.ControlModifier:
-                self.back_search()
-            else:
-                self.back()
-        elif key == Qt.Key_Down:
-            self.forward()
-        elif key == Qt.Key_Return or key == Qt.Key_Enter:
-            # filter out "Return" instead of binding lineedit.returnPressed,
-            # because otherwise OrthoKey would capture it as well.
-            self.doPrompt()
-        else:
-            return False
-        return True
-
     def eventFilter(self, watched, event):
         '''
         Filter out <Tab> event to do tab-completion instead of move focus
         '''
         type_ = event.type()
-        if type_ == QtCore.QEvent.KeyRelease:
-            if event.key() == Qt.Key_Tab:
-                # silently skip tab release
-                return True
-        elif type_ == QtCore.QEvent.KeyPress:
-            if watched is self.lineedit:
-                return self.lineeditKeyPressEventFilter(watched, event)
-            elif event.key() == Qt.Key_Tab:
+        if watched is self.pymolwidget:
+            if type_ == QtCore.QEvent.KeyRelease:
+                if event.key() == Qt.Key_Tab:
+                    # silently skip tab release
+                    return True
+            elif type_ == QtCore.QEvent.KeyPress and event.key() == Qt.Key_Tab:
                 self.keyPressEvent(event)
                 return True
         return False
 
     def toggle_ext_window_dockable(self, neverfloat=False):
         '''
-        Toggle whether the "external" GUI is dockable
+        Backward compatible command hook: toggle assistant chat visibility
         '''
-        dockWidget = self.ext_window
-
-        if dockWidget.titleBarWidget() is None:
-            tbw = QtWidgets.QWidget()
-        else:
-            tbw = None
-
-        dockWidget.setFloating(tbw is None and not neverfloat)
-        dockWidget.setTitleBarWidget(tbw)
-        dockWidget.show()
+        self.ext_window.setVisible(not self.ext_window.isVisible())
 
     def toggle_fullscreen(self, toggle=-1):
         '''
@@ -920,34 +806,126 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
     #################
 
     def command_get(self):
-        return self.lineedit.text()
+        return self.chat_panel.input_text()
 
     def command_set(self, v):
-        return self.lineedit.setText(v)
+        return self.chat_panel.set_input_text(v)
 
     def command_set_cursor(self, i):
-        return self.lineedit.setCursorPosition(i)
+        return self.chat_panel.set_input_cursor(i)
+
+    def _persist_runtime_state_now(self):
+        if self._chat_store is None:
+            return
+        chat_id = getattr(self._chat_store, "current_chat_id", None)
+        if not chat_id:
+            return
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is None:
+            return
+        self._chat_store.set_runtime_state(chat_id, runtime.export_session_state())
+
+    def _sync_ai_settings_menu_from_runtime(self):
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is None:
+            return
+
+        runtime.set_ui_mode('qt')
+        reasoning = bool(runtime.reasoning_visible)
+        debug_mode = bool(runtime.trace_stream_chunks)
+        mode = str(runtime.current_agent_mode or "work").lower()
+
+        if hasattr(self, "ai_reasoning_action"):
+            self.ai_reasoning_action.blockSignals(True)
+            self.ai_reasoning_action.setChecked(reasoning)
+            self.ai_reasoning_action.blockSignals(False)
+        if hasattr(self, "ai_debug_action"):
+            self.ai_debug_action.blockSignals(True)
+            self.ai_debug_action.setChecked(debug_mode)
+            self.ai_debug_action.blockSignals(False)
+        if hasattr(self, "ai_mode_work_action") and hasattr(self, "ai_mode_tutor_action"):
+            self.ai_mode_work_action.blockSignals(True)
+            self.ai_mode_tutor_action.blockSignals(True)
+            self.ai_mode_work_action.setChecked(mode != "tutor")
+            self.ai_mode_tutor_action.setChecked(mode == "tutor")
+            self.ai_mode_work_action.blockSignals(False)
+            self.ai_mode_tutor_action.blockSignals(False)
+
+    def set_ai_reasoning_visible(self, visible):
+        pymol._gui.PyMOLDesktopGUI.set_ai_reasoning_visible(self, visible)
+        self._persist_runtime_state_now()
+        self._sync_ai_settings_menu_from_runtime()
+
+    def set_ai_debug_mode(self, visible):
+        pymol._gui.PyMOLDesktopGUI.set_ai_debug_mode(self, visible)
+        self._persist_runtime_state_now()
+        self._sync_ai_settings_menu_from_runtime()
+
+    def set_ai_agent_mode(self, mode):
+        pymol._gui.PyMOLDesktopGUI.set_ai_agent_mode(self, mode)
+        self._persist_runtime_state_now()
+        self._sync_ai_settings_menu_from_runtime()
+
+    def _on_ai_api_key_changed(self):
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            runtime.ensure_ai_default_mode(emit_notice=False)
+        self._persist_runtime_state_now()
+        self._sync_ai_settings_menu_from_runtime()
+
+    def _open_ai_api_key_dialog(self):
+        from .ai_api_key_dialog import AiApiKeyDialog
+
+        runtime = self.get_ai_runtime(create=True)
+        model = getattr(runtime, "model", None) if runtime is not None else None
+        self.ai_api_key_dialog = AiApiKeyDialog(
+            self,
+            model=str(model or ""),
+            on_changed=self._on_ai_api_key_changed,
+        )
+        self.ai_api_key_dialog.exec_()
+
+    def _open_ai_openbio_api_key_dialog(self):
+        from .ai_openbio_api_key_dialog import AiOpenBioApiKeyDialog
+
+        self.ai_openbio_api_key_dialog = AiOpenBioApiKeyDialog(
+            self,
+            on_changed=self._on_ai_api_key_changed,
+        )
+        self.ai_openbio_api_key_dialog.exec_()
 
     def update_progress(self):
-        progress = int(self.cmd.get_progress() * 100)
-        if progress >= 0:
-            self.progressbar.setValue(progress)
-            self.progressbar.show()
-            self.abortbutton.show()
-        else:
-            self.progressbar.hide()
-            self.abortbutton.hide()
+        return
 
     def update_feedback(self):
         self.update_progress()
+        next_feedback_ms = 500
+
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            batch_size = max(1, int(getattr(runtime, "ui_event_batch", 40)))
+            events = runtime.drain_ui_events(limit=batch_size)
+            if events:
+                self.chat_panel.append_ai_events(events)
+                self._persist_runtime_events(events, runtime)
+            if runtime.has_pending_ui_events():
+                next_feedback_ms = 0
+            self.chat_panel.set_mode(runtime.current_input_mode)
+            self.chat_panel.set_agent_running(runtime.is_busy)
+        else:
+            self.chat_panel.set_mode("ai")
+            self.chat_panel.set_agent_running(False)
 
         feedback = self.cmd._get_feedback()
         if feedback:
-            html = colorprinting.text2html('\n'.join(feedback))
-            self.browser.appendHtml(html)
+            filtered_feedback = self._filter_internal_feedback_lines(feedback)
+            if filtered_feedback and self._chat_has_user_input:
+                block = '\n'.join(str(x) for x in filtered_feedback)
+                self.chat_panel.append_feedback_block(block)
+                self._persist_feedback_block(block)
 
-            scrollbar = self.browser.verticalScrollBar()
-            scrollbar.setValue(scrollbar.maximum())
+        if self._chat_store is not None:
+            self._chat_store.pump(self._save_chat_checkpoint)
 
         for setting in self.cmd.get_setting_updates() or ():
             if setting in self.setting_callbacks:
@@ -955,13 +933,276 @@ PyMOL> color ye<TAB>    (will autocomplete "yellow")
                 for callback in self.setting_callbacks[setting]:
                     callback(current_value)
 
-        self.feedback_timer.start(500)
+        self.feedback_timer.start(next_feedback_ms)
+
+    @staticmethod
+    def _filter_internal_feedback_lines(lines):
+        out = []
+        skip_overlay_size_detail = 0
+        for line in lines:
+            text = str(line or "")
+            if "[PyMolAI]" in text:
+                continue
+            if skip_overlay_size_detail > 0:
+                if text.startswith("Image:") or text.startswith("Overlay:"):
+                    skip_overlay_size_detail -= 1
+                    continue
+                skip_overlay_size_detail = 0
+
+            if text.startswith("Image and overlay sizes do not match"):
+                skip_overlay_size_detail = 2
+                continue
+
+            out.append(line)
+        return out
+
+    def _on_chat_command_submitted(self, text):
+        self._chat_has_user_input = True
+        self.doTypedCommand(text)
+        self.pymolwidget._pymolProcess()
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            self.chat_panel.set_agent_running(runtime.is_busy)
+        self.feedback_timer.start(0)
+
+    def _on_chat_clear_requested(self):
+        self.chat_panel.clear_transcript()
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            runtime.clear_session(emit_notice=False)
+            runtime.ensure_ai_default_mode(emit_notice=False)
+            self._sync_ai_settings_menu_from_runtime()
+        current_id = getattr(self._chat_store, "current_chat_id", None)
+        if current_id:
+            self._chat_store.delete_chat(current_id)
+        self._chat_has_user_input = False
+        self._start_new_chat_session(title_hint="")
+        self.feedback_timer.start(0)
+
+    def _on_chat_stop_requested(self):
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            runtime.request_cancel()
+        self.cmd.interrupt()
+        self.feedback_timer.start(0)
+
+    def _start_new_chat_session(self, title_hint: str = ""):
+        chat_id = self._chat_store.create_chat(title_hint=title_hint)
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            self._chat_store.set_runtime_state(chat_id, runtime.export_session_state())
+
+    def _persist_runtime_events(self, events, runtime):
+        chat_id = getattr(self._chat_store, "current_chat_id", None)
+        if not chat_id:
+            self._start_new_chat_session(title_hint="")
+            chat_id = self._chat_store.current_chat_id
+        if not chat_id:
+            return
+
+        self._chat_store.append_events(chat_id, events)
+
+        for event in events:
+            role_obj = getattr(event, "role", "")
+            role = getattr(role_obj, "value", role_obj)
+            if str(role) != "tool_result":
+                continue
+            if not bool(getattr(event, "ok", False)):
+                continue
+            metadata = dict(getattr(event, "metadata", None) or {})
+            if str(metadata.get("tool_name") or "") != "run_pymol_command":
+                continue
+            payload = metadata.get("tool_result_json")
+            if isinstance(payload, dict) and payload.get("skipped"):
+                continue
+            self._chat_store.mark_scene_dirty(chat_id, reason="command_ok")
+            self._chat_store.schedule_checkpoint(chat_id)
+
+        self._chat_store.set_runtime_state(chat_id, runtime.export_session_state())
+
+    def _persist_feedback_block(self, text: str):
+        if not text.strip():
+            return
+        chat_id = getattr(self._chat_store, "current_chat_id", None)
+        if not chat_id:
+            return
+        event = UiEvent(
+            role=UiRole.SYSTEM,
+            text=text,
+            metadata={"source": "pymol_feedback"},
+        )
+        self._chat_store.append_events(chat_id, [event])
+
+    def _save_chat_checkpoint(self, session_path: str):
+        self.cmd.save(session_path, format='pse', quiet=1)
+
+    def _list_chat_rows(self, query: str, offset: int, limit: int):
+        return self._chat_store.list_chats(query=query, offset=offset, limit=limit)
+
+    def _has_unsaved_chat_work(self) -> bool:
+        if self.chat_panel.input_text().strip():
+            return True
+        return bool(self._chat_store.has_unsaved_changes())
+
+    def _on_chat_history_requested(self):
+        self._history_popup.open_at(self.chat_panel.history_anchor_widget())
+
+    def _on_history_chat_selected(self, chat_id: str):
+        if not chat_id:
+            return
+
+        if self._has_unsaved_chat_work():
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("Unsaved Work")
+            box.setText("Current chat has unsaved work. What do you want to do?")
+            save_btn = box.addButton("Save now", QtWidgets.QMessageBox.AcceptRole)
+            discard_btn = box.addButton("Discard and continue", QtWidgets.QMessageBox.DestructiveRole)
+            cancel_btn = box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked == cancel_btn:
+                return
+            if clicked == save_btn:
+                self._chat_store.flush_now()
+                self._chat_store.force_checkpoint(self._save_chat_checkpoint)
+            elif clicked != discard_btn:
+                return
+
+        payload = self._chat_store.load_chat(chat_id)
+        if not payload:
+            QtWidgets.QMessageBox.warning(self, "Load Chat", "Could not load selected chat.")
+            return
+
+        session_path = str(payload.get("session_path") or "")
+        session_loaded = False
+        if payload.get("session_exists") and session_path:
+            try:
+                self.cmd.load(session_path, format='pse', quiet=0)
+                session_loaded = True
+            except Exception as exc:  # noqa: BLE001
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Session Load Failed",
+                    "Could not load saved session for this chat:\n%s" % (exc,),
+                )
+        else:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Session Missing",
+                "Saved session file is missing for this chat. Loading transcript only.",
+            )
+
+        if not session_loaded:
+            fallback = self._chat_store.get_last_valid_session_path(exclude_chat_id=chat_id)
+            if fallback:
+                choice = QtWidgets.QMessageBox.question(
+                    self,
+                    "Use Last Valid Session",
+                    "Load the last valid saved session instead?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.Yes,
+                )
+                if choice == QtWidgets.QMessageBox.Yes:
+                    try:
+                        self.cmd.load(fallback, format='pse', quiet=0)
+                    except Exception:
+                        pass
+
+        self._chat_store.open_chat(chat_id)
+
+        manifest = payload.get("manifest") or {}
+        runtime_state = dict(manifest.get("runtime_state") or {})
+        mode = str(runtime_state.get("input_mode") or "ai")
+        events = payload.get("events") or []
+
+        runtime = self.get_ai_runtime(create=True)
+        if runtime is not None:
+            runtime.import_session_state(runtime_state, apply_model=False)
+            runtime.reset_remote_session_binding(reason="history_chat_selected")
+            mode = runtime.current_input_mode
+            self._sync_ai_settings_menu_from_runtime()
+            self._chat_store.set_runtime_state(chat_id, runtime.export_session_state())
+
+        self.chat_panel.replace_transcript(events, mode)
+        self._chat_has_user_input = any(str((e or {}).get("role") or "") == "user" for e in events if isinstance(e, dict))
+        self.feedback_timer.start(0)
+
+    def _on_chat_new_requested(self):
+        if self._chat_store.count_chats() >= self._chat_store.soft_cap:
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("History Soft Cap")
+            box.setText("You have many saved chats. Choose a cleanup action or keep all.")
+            keep_btn = box.addButton("Keep all", QtWidgets.QMessageBox.AcceptRole)
+            del10_btn = box.addButton("Delete oldest 10", QtWidgets.QMessageBox.DestructiveRole)
+            del25_btn = box.addButton("Delete oldest 25", QtWidgets.QMessageBox.DestructiveRole)
+            del50_btn = box.addButton("Delete oldest 50", QtWidgets.QMessageBox.DestructiveRole)
+            manager_btn = box.addButton("Open manager", QtWidgets.QMessageBox.ActionRole)
+            cancel_btn = box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked == cancel_btn:
+                return
+            if clicked == del10_btn:
+                self._chat_store.delete_oldest(10)
+            elif clicked == del25_btn:
+                self._chat_store.delete_oldest(25)
+            elif clicked == del50_btn:
+                self._chat_store.delete_oldest(50)
+            elif clicked == manager_btn:
+                self._open_history_manager()
+                return
+            elif clicked != keep_btn:
+                return
+
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("New Chat")
+        box.setText("Start a new chat session:")
+        keep_scene_btn = box.addButton("Keep current scene, clear chat", QtWidgets.QMessageBox.AcceptRole)
+        reset_scene_btn = box.addButton("Clear chat + reinitialize scene", QtWidgets.QMessageBox.DestructiveRole)
+        cancel_btn = box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked == cancel_btn:
+            return
+
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            runtime.clear_session(emit_notice=False)
+            runtime.ensure_ai_default_mode(emit_notice=False)
+            self._sync_ai_settings_menu_from_runtime()
+        self.chat_panel.clear_transcript()
+        self._chat_has_user_input = False
+
+        if clicked == reset_scene_btn:
+            self.cmd.reinitialize()
+
+        self._start_new_chat_session(title_hint="")
+        self.feedback_timer.start(0)
+
+    def _open_history_manager(self):
+        dlg = ChatHistoryManagerDialog(self._list_chat_rows, self._delete_chat_by_id, self)
+        dlg.exec_()
+
+    def _delete_chat_by_id(self, chat_id: str) -> bool:
+        was_current = chat_id == getattr(self._chat_store, "current_chat_id", None)
+        deleted = self._chat_store.delete_chat(chat_id)
+        if deleted and was_current:
+            runtime = self.get_ai_runtime(create=False)
+            if runtime is not None:
+                runtime.clear_session(emit_notice=False)
+                runtime.ensure_ai_default_mode(emit_notice=False)
+                self._sync_ai_settings_menu_from_runtime()
+            self.chat_panel.clear_transcript()
+            self._chat_has_user_input = False
+            self._start_new_chat_session(title_hint="")
+        return deleted
 
     def doPrompt(self):
-        self.doTypedCommand(self.command_get())
-        self.pymolwidget._pymolProcess()
-        self.lineedit.clear()
-        self.feedback_timer.start(0)
+        text = self.command_get().strip()
+        if not text:
+            return
+        self.command_set("")
+        self._on_chat_command_submitted(text)
 
     ##########################
     # legacy plugin system

@@ -911,7 +911,39 @@ class PyMOLDesktopGUI(object):
             if len(self.history) > 255:
                 self.history.pop()
         self.history_cur = 0
-        self.cmd.do(cmmd)
+
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is None:
+            runtime = self.get_ai_runtime(create=True)
+
+        handled = False
+        if runtime is not None:
+            handled = runtime.handle_typed_input(cmmd)
+
+        if not handled:
+            self.cmd.do(cmmd)
+
+    def get_ai_runtime(self, create=True):
+        try:
+            from pymol.ai.runtime import get_ai_runtime
+        except Exception:
+            return None
+        return get_ai_runtime(self.cmd, create=create)
+
+    def set_ai_reasoning_visible(self, visible):
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            runtime.set_reasoning_visible(bool(visible))
+
+    def set_ai_debug_mode(self, visible):
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            runtime.set_debug_mode(bool(visible))
+
+    def set_ai_agent_mode(self, mode):
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            runtime.set_agent_mode(str(mode))
 
     def back_search(self, set0=False):
         '''Command line history back search'''

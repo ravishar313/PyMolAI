@@ -2,6 +2,9 @@
 PyMOL is Copyright (c) Schrodinger, LLC
 http://www.pymol.org
 ----------------------------------------------------------------------
+PyMolAI fork additions in this repository are maintained by Ravi.
+Upstream Schrodinger, LLC notices and trademark terms remain in force.
+----------------------------------------------------------------------
 PyMOL is an OPEN SOURCE program distributed under the "Python" license.
 Please see the LICENSE file for additional information.
 ----------------------------------------------------------------------
@@ -277,5 +280,4 @@ Specific Acknowledgments (last updated around 2005):
   bug sightings, and encouragement they've provided.
 
       
-
 

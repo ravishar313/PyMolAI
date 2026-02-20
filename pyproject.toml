@@ -15,6 +15,9 @@ authors = [
 ]
 dependencies = [
   "numpy>=2.0",
+  "openai>=1.0.0",
+  "keyring>=24",
+  "claude-agent-sdk>=0.1.38; python_version >= '3.10'",
 ]
 
 [build-system]
@@ -51,4 +54,3 @@ where = ["modules"]
 
 [tool.setuptools.package-data]
 pmg_qt = ["forms/*.ui"]
-

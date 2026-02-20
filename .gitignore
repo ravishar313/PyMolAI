@@ -3,3 +3,6 @@
 generated
 build
 .vscode
+.venv/
+*.egg-info
+.venv_py39_backup/*
