@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from pymol.ai import runtime as runtime_module
 from pymol.ai.api_key_store import ApiKeyStatus
+from pymol.ai.openbio_api_key_store import ApiKeyStatus as OpenBioApiKeyStatus
 from pymol.ai.message_types import UiEvent, UiRole
 from pymol.ai.runtime import AiRuntime
 from pymol.shortcut import Shortcut
@@ -73,6 +74,14 @@ class FakeSdkLoop:
                 kwargs["run_command_tool"](action.get("id", "call_run"), action.get("args", {}))
             elif action["kind"] == "tool_snapshot":
                 kwargs["snapshot_tool"](action.get("id", "call_snapshot"), action.get("args", {}))
+            elif action["kind"] == "openbio_tool":
+                cb = kwargs.get("openbio_api_tool")
+                if cb:
+                    cb(
+                        action.get("id", "call_openbio"),
+                        action.get("tool_name", "openbio_api_health"),
+                        action.get("args", {}),
+                    )
             elif action["kind"] == "external_tool_result":
                 cb = kwargs.get("on_tool_result")
                 if cb:
@@ -137,6 +146,30 @@ def test_runtime_bootstraps_saved_api_key(monkeypatch):
     assert runtime.enabled is True
     assert runtime._api_key == "saved-key-1234"
     assert runtime._api_key_source == "saved"
+
+
+def test_runtime_bootstraps_saved_openbio_api_key(monkeypatch):
+    monkeypatch.delenv("OPENBIO_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("PYMOL_AI_REASONING_DEFAULT", "0")
+    monkeypatch.setenv("PYMOL_AI_CONVERSATION_MODE", "local_first")
+
+    def fake_load_openbio():
+        monkeypatch.setenv("OPENBIO_API_KEY", "saved-openbio-key-1234")
+        return OpenBioApiKeyStatus(
+            has_key=True,
+            source="saved",
+            masked_key="****1234",
+            keyring_available=True,
+        )
+
+    monkeypatch.setattr(runtime_module, "load_openbio_saved_key_into_env_if_needed", fake_load_openbio)
+
+    runtime = AiRuntime(DummyCmd())
+    runtime.set_ui_mode("qt")
+
+    assert runtime._openbio_api_key == "saved-openbio-key-1234"
+    assert runtime._openbio_api_key_source == "saved"
 
 
 def test_drain_ui_events_limit_preserves_remainder(monkeypatch):
@@ -599,3 +632,62 @@ def test_internal_system_reminders_not_visible(monkeypatch):
     assert len(events) == 1
     assert events[0].role == UiRole.SYSTEM
     assert events[0].text == "AI mode enabled"
+
+
+def test_openbio_tools_not_available_without_openbio_key(monkeypatch):
+    monkeypatch.delenv("OPENBIO_API_KEY", raising=False)
+    runtime = _runtime(monkeypatch)
+    runtime._sdk_loop = FakeSdkLoop([{"assistant_text": "ok", "session_id": "sess_no_openbio"}])
+
+    runtime._agent_worker("list openbio tools")
+
+    assert len(runtime._sdk_loop.calls) == 1
+    assert runtime._sdk_loop.calls[0].get("openbio_api_tool") is None
+
+
+def test_openbio_tool_execution_emits_tool_result_and_history(monkeypatch):
+    monkeypatch.setenv("OPENBIO_API_KEY", "openbio-test-key")
+    runtime = _runtime(monkeypatch)
+    runtime.screenshot_validate_required = False
+    runtime._sdk_loop = FakeSdkLoop(
+        [
+            {
+                "actions": [
+                    {
+                        "kind": "openbio_tool",
+                        "id": "ob_1",
+                        "tool_name": "openbio_api_list_tools",
+                        "args": {"category": "pubmed", "limit": 3},
+                    }
+                ],
+                "assistant_text": "Done",
+                "session_id": "sess_openbio",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(
+        runtime_module,
+        "execute_openbio_api_gateway_tool",
+        lambda tool_name, tool_args, **_kwargs: {
+            "ok": True,
+            "tool_name": tool_name,
+            "echo_args": dict(tool_args or {}),
+        },
+    )
+
+    runtime._agent_worker("find pubmed tools")
+    events = _events(runtime)
+    openbio_events = [
+        e
+        for e in events
+        if e.role == UiRole.TOOL_RESULT and e.metadata.get("tool_name") == "openbio_api_list_tools"
+    ]
+    assert openbio_events
+    assert openbio_events[0].ok is True
+    result_json = openbio_events[0].metadata.get("tool_result_json")
+    assert "echo_args" in str(result_json)
+    assert any(
+        m.get("role") == "tool" and m.get("name") == "openbio_api_list_tools"
+        for m in runtime.history
+    )

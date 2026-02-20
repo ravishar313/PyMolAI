@@ -274,6 +274,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.ai_debug_action.setCheckable(True)
 
         self.ai_api_key_action = ai_menu.addAction('OpenRouter API Key...')
+        self.ai_openbio_api_key_action = ai_menu.addAction('OpenBio API Key...')
 
         ai_mode_menu = ai_menu.addMenu('Assistant Mode')
         self.ai_mode_action_group = QtWidgets.QActionGroup(self)
@@ -294,6 +295,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.ai_reasoning_action.toggled.connect(self.set_ai_reasoning_visible)
         self.ai_debug_action.toggled.connect(self.set_ai_debug_mode)
         self.ai_api_key_action.triggered.connect(self._open_ai_api_key_dialog)
+        self.ai_openbio_api_key_action.triggered.connect(self._open_ai_openbio_api_key_dialog)
         self.ai_mode_work_action.toggled.connect(lambda checked: checked and self.set_ai_agent_mode('work'))
         self.ai_mode_tutor_action.toggled.connect(lambda checked: checked and self.set_ai_agent_mode('tutor'))
 
@@ -883,6 +885,15 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         )
         self.ai_api_key_dialog.exec_()
 
+    def _open_ai_openbio_api_key_dialog(self):
+        from .ai_openbio_api_key_dialog import AiOpenBioApiKeyDialog
+
+        self.ai_openbio_api_key_dialog = AiOpenBioApiKeyDialog(
+            self,
+            on_changed=self._on_ai_api_key_changed,
+        )
+        self.ai_openbio_api_key_dialog.exec_()
+
     def update_progress(self):
         return
 
@@ -900,8 +911,10 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             if runtime.has_pending_ui_events():
                 next_feedback_ms = 0
             self.chat_panel.set_mode(runtime.current_input_mode)
+            self.chat_panel.set_agent_running(runtime.is_busy)
         else:
             self.chat_panel.set_mode("ai")
+            self.chat_panel.set_agent_running(False)
 
         feedback = self.cmd._get_feedback()
         if feedback:
@@ -947,6 +960,9 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self._chat_has_user_input = True
         self.doTypedCommand(text)
         self.pymolwidget._pymolProcess()
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            self.chat_panel.set_agent_running(runtime.is_busy)
         self.feedback_timer.start(0)
 
     def _on_chat_clear_requested(self):
