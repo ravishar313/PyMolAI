@@ -46,6 +46,13 @@ PyMolAI chat UI is designed for Qt desktop usage (`pmg_qt`).
 
 ## macOS (source install with uv)
 
+### Step 0 — Clone the repository
+
+```bash
+git clone https://github.com/ravishar313/PyMolAI
+cd PyMolAI
+```
+
 ### Step 1 — Install system dependencies (Homebrew)
 
 The C++ build requires several native libraries. Install them before building:
@@ -65,7 +72,6 @@ brew install libxml2 freetype libpng
 Use `uv` (recommended):
 
 ```bash
-cd /path/to/pymol
 uv venv .venv
 source .venv/bin/activate
 PREFIX_PATH=/opt/homebrew:/opt/homebrew/opt/libxml2:/opt/homebrew/opt/netcdf uv pip install --python .venv/bin/python --reinstall .
@@ -92,7 +98,8 @@ If `claude_agent_sdk` import fails, verify the interpreter is Python 3.10+.
 ## Windows (PowerShell, source install with uv)
 
 ```powershell
-cd C:\path\to\pymol
+git clone https://github.com/ravishar313/PyMolAI
+cd PyMolAI
 uv venv .venv --python 3.10
 .\.venv\Scripts\Activate.ps1
 $env:PREFIX_PATH = "C:\path\to\deps"; uv pip install --python .venv\Scripts\python.exe --reinstall .
@@ -113,11 +120,12 @@ python -c "from PyQt5 import QtWidgets; print('ok: PyQt5')"
 2. Open AI settings from:
 - `Display -> PyMolAI Settings -> OpenRouter API Key...`
 - `Display -> PyMolAI Settings -> OpenBio API Key...`
-3. In the OpenRouter dialog:
+3. To create an OpenBio API key, sign up at [openbio.tech](https://openbio.tech/) first.
+4. In the OpenRouter dialog:
 - Save key (stores in system keychain)
 - Test key
 - Clear key
-4. In the OpenBio dialog (optional):
+5. In the OpenBio dialog (optional):
 - Save key
 - Test key
 - Clear key

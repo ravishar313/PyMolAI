@@ -27,11 +27,14 @@ Qt REQUIREMENT
 
 macOS QUICK PATH
 
+    Step 0 - Clone repository:
+    git clone https://github.com/ravishar313/PyMolAI
+    cd PyMolAI
+
     Step 1 - Install system build dependencies (Homebrew):
     brew install netcdf glew glm
 
     Step 2 - Create venv and build/install:
-    cd /path/to/pymol
     uv venv .venv
     source .venv/bin/activate
     PREFIX_PATH=/opt/homebrew:/opt/homebrew/opt/libxml2:/opt/homebrew/opt/netcdf \
@@ -47,7 +50,8 @@ macOS QUICK PATH
 
 Windows (PowerShell) QUICK PATH
 
-    cd C:\path\to\pymol
+    git clone https://github.com/ravishar313/PyMolAI
+    cd PyMolAI
     uv venv .venv --python 3.10
     .\.venv\Scripts\Activate.ps1
     $env:PREFIX_PATH = "C:\path\to\deps"
@@ -64,6 +68,9 @@ KEY SETUP IN APP
     Open these menus in the PyMOL GUI:
       Display -> PyMolAI Settings -> OpenRouter API Key...
       Display -> PyMolAI Settings -> OpenBio API Key...
+
+    OpenBio key creation:
+      - Sign up at https://openbio.tech/ to create an OpenBio API key.
 
     Notes:
       - OpenRouter key is required for AI mode.

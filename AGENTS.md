@@ -16,7 +16,8 @@ Core points:
 1. Install project in a virtual environment.
 2. Launch PyMOL GUI.
 3. Open `Display -> PyMolAI Settings -> OpenRouter API Key...` and save/test key.
-4. Optionally open `Display -> PyMolAI Settings -> OpenBio API Key...` and save/test key.
+4. For OpenBio access, sign up at https://openbio.tech/ and create an OpenBio API key.
+5. Optionally open `Display -> PyMolAI Settings -> OpenBio API Key...` and save/test key.
 
 ## 3) Agent-Safe Setup Scripts
 
@@ -34,7 +35,8 @@ brew install netcdf glew glm
 ## macOS
 
 ```bash
-cd /path/to/pymol
+git clone https://github.com/ravishar313/PyMolAI
+cd PyMolAI
 # Create venv with uv (Python 3.10+ for full claude-agent-sdk support)
 uv venv .venv
 source .venv/bin/activate
@@ -56,7 +58,8 @@ uv pip install --python .venv/bin/python PyQt5
 ## Windows (PowerShell)
 
 ```powershell
-cd C:\path\to\pymol
+git clone https://github.com/ravishar313/PyMolAI
+cd PyMolAI
 uv venv .venv --python 3.10
 .\.venv\Scripts\Activate.ps1
 $env:PREFIX_PATH = "C:\path\to\deps"
