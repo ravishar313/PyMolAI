@@ -1,41 +1,64 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
 import time
+import uuid
 from typing import Dict, List, Optional, Tuple
 
-from .doom_loop_detector import DoomLoopDetector
-from .message_types import ToolCall, UiEvent, UiRole
-from .openrouter_client import (
-    DEFAULT_MODEL,
-    OpenRouterClient,
-    OpenRouterClientError,
-    build_multimodal_user_content,
-)
+from .claude_sdk_loop import ClaudeSdkLoop
+from .message_types import UiEvent, UiRole
+from .openrouter_client import DEFAULT_MODEL
+from .api_key_store import load_saved_key_into_env_if_needed
+from .openbio_api_key_store import load_saved_key_into_env_if_needed as load_openbio_saved_key_into_env_if_needed
+from .openbio_client import execute_openbio_api_gateway_tool
 from .state_snapshot import build_viewer_state_snapshot
 from .tool_execution import run_pymol_command
 from .vision_capture import capture_viewer_snapshot
 
-SYSTEM_PROMPT = """You are a PyMOL desktop agent.
+SYSTEM_PROMPT_BASE = """You are a PyMOL desktop agent.
 You can either:
 1) call tools to act in PyMOL, or
 2) provide a final direct answer without tool calls.
 
 Rules:
 - Use tool calls when an action/query in PyMOL is needed.
-- If tool results already answer the user, return a concise final answer and DO NOT call tools.
-- Do not use shell commands.
+- If tool results already answer the user, return a final direct answer and DO NOT call tools.
+- Prefer minimal, reversible commands first; escalate complexity only when needed.
+- If you use terminal commands, run them only when required and only to support the user's request.
+- Always report terminal actions factually from tool output; do not claim actions that were not actually executed.
+- If external dependencies (like ffmpeg) are missing, state that limitation plainly and ask the user to install them.
 - Prefer continuing current session state; avoid redundant fetch/load.
+- If you are unsure about PyMOL command syntax/options, check help before guessing (e.g., help <command>), then proceed.
+- On command failure: read the error, check help for the failing command, and retry once with corrected syntax.
+- For multi-step workflows, first provide a brief plan (2-4 steps), then execute.
+- For potentially destructive or global actions (e.g., delete/remove/wide hide-show-reset), ask for confirmation first.
 - capture_viewer_snapshot is INTERNAL validation only. The user cannot see this image in chat.
 - Never say you are taking a screenshot "to show" the user.
 - If you use capture_viewer_snapshot, describe it as internal validation of viewer state.
+- After state-changing commands, use capture_viewer_snapshot to verify the scene actually reflects the requested outcome.
+- In long workflows, capture_viewer_snapshot between major phases as checkpoints.
+- Before any final visual claim, ensure a recent capture_viewer_snapshot-based validation exists.
+- Do not claim completion until scene validation has been performed (or explicitly explain why validation failed).
 - Do not repeat the same setup sentence or intent text step after step.
 - If a strategy fails repeatedly, switch approach or ask the user for clarification.
 - Do not re-run the same successful command in the same request unless you clearly explain why.
-- Keep answers concise and practical.
+- End each turn with a concise structured summary: actions completed, key outputs/observations, and next step (if any).
+"""
+
+SYSTEM_PROMPT_WORK_OVERLAY = """Mode: Work
+- Prioritize getting the requested work done end-to-end.
+- Keep narration concise while executing.
+- End with a concise summary of what you did and current result state.
+"""
+
+SYSTEM_PROMPT_TUTOR_OVERLAY = """Mode: Tutor
+- Teach as you work: explain what each command does and why it is used.
+- Briefly explain command syntax when relevant.
+- Prefer clear, instructional explanations over terse status updates.
 """
 
 _READ_ONLY_PREFIXES = (
@@ -50,8 +73,8 @@ _RE_PDB_ID = re.compile(r"^[0-9][A-Za-z0-9]{3}$")
 _HIDDEN_SYSTEM_PREFIXES = (
     "Validation required:",
     "Visual validation required now:",
-    "DOOM LOOP DETECTED:",
 )
+_CONVERSATION_MODES = ("local_first", "hybrid_resume", "resume_only")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -71,19 +94,32 @@ def _env_float(name: str, default: float) -> float:
 class AiRuntime:
     def __init__(self, cmd):
         self.cmd = cmd
+        self._logger = logging.getLogger("pymol.ai")
+        self._log_to_terminal = os.getenv("PYMOL_AI_LOG_STDOUT", "1") != "0"
+        self._log_to_python_logger = os.getenv("PYMOL_AI_LOGGER", "0") == "1"
+        key_status = load_saved_key_into_env_if_needed()
+        self._api_key_source = key_status.source
+        openbio_key_status = load_openbio_saved_key_into_env_if_needed()
+        self._openbio_api_key_source = openbio_key_status.source
         self.history: List[Dict[str, object]] = []
         self.model = os.getenv("PYMOL_AI_DEFAULT_MODEL") or DEFAULT_MODEL
-        self.reasoning_visible = False
+        self.reasoning_visible = _env_int("PYMOL_AI_REASONING_DEFAULT", 1) == 1
+        self.agent_mode = self._normalize_agent_mode(os.getenv("PYMOL_AI_AGENT_MODE") or "work")
         self.input_mode = "ai"
         self.final_answer_enabled = os.getenv("PYMOL_AI_FINAL_ANSWER", "1") != "0"
 
-        self.max_agent_steps = _env_int("PYMOL_AI_MAX_STEPS", 16)
-        self.max_auto_repairs = _env_int("PYMOL_AI_MAX_REPAIRS", 4)
+        self.max_agent_steps = max(1, _env_int("PYMOL_AI_MAX_STEPS", 64))
         self.tool_result_max_chars = _env_int("PYMOL_AI_TOOL_RESULT_MAX_CHARS", 4096)
-        self.doom_loop_threshold = _env_int("PYMOL_AI_DOOM_LOOP_THRESHOLD", 3)
         self.long_tool_warn_sec = _env_float("PYMOL_AI_LONG_TOOL_WARN_SEC", 8.0)
         self.ui_event_batch = max(1, _env_int("PYMOL_AI_UI_EVENT_BATCH", 40))
         self.ui_max_events = max(0, _env_int("PYMOL_AI_UI_MAX_EVENTS", 2000))
+        self.sdk_max_buffer_size = max(0, _env_int("PYMOL_AI_SDK_MAX_BUFFER_SIZE", 10 * 1024 * 1024))
+        self.history_max_messages = max(1, _env_int("PYMOL_AI_HISTORY_MAX_MESSAGES", 80))
+        self.history_max_chars = max(512, _env_int("PYMOL_AI_HISTORY_MAX_CHARS", 12000))
+        self.conversation_mode = self._normalize_conversation_mode(
+            os.getenv("PYMOL_AI_CONVERSATION_MODE") or "local_first"
+        )
+        self.trace_stream_chunks = _env_int("PYMOL_AI_TRACE_STREAM", 0) == 1
 
         self.screenshot_width = _env_int("PYMOL_AI_SCREENSHOT_WIDTH", 1024)
         self.screenshot_height = _env_int("PYMOL_AI_SCREENSHOT_HEIGHT", 0)
@@ -101,19 +137,71 @@ class AiRuntime:
 
         self._stream_line_buffer = ""
         self._stream_had_output = False
+        self._stream_full_text = ""
 
         disabled = os.getenv("PYMOL_AI_DISABLE", "").strip() == "1"
         self.enabled = bool(self._api_key) and not disabled
 
-        self._client: Optional[OpenRouterClient] = None
+        self._agent_backend = "claude_sdk"
+        self._sdk_session_id: Optional[str] = None
+        self._chat_query_session_id = self._new_chat_query_session_id()
+        self._sdk_loop = ClaudeSdkLoop(logger=self._log_ai)
+        self._sdk_loop.set_trace_stream(self.trace_stream_chunks)
+        self._sdk_loop.map_openrouter_env()
         self._recent_tool_results: List[Dict[str, object]] = []
+        self._log_ai(
+            "runtime initialized",
+            enabled=self.enabled,
+            input_mode=self.input_mode,
+            model=self.model,
+            reasoning_visible=self.reasoning_visible,
+            agent_mode=self.agent_mode,
+            debug_mode=self.trace_stream_chunks,
+            backend=self._agent_backend,
+            api_key_set=bool(self._api_key),
+            api_key_source=self._api_key_source,
+            openbio_api_key_set=bool(self._openbio_api_key),
+            openbio_api_key_source=self._openbio_api_key_source,
+            conversation_mode=self.conversation_mode,
+            query_session_id=self._chat_query_session_id,
+        )
 
     @property
     def _api_key(self) -> str:
-        return os.getenv("OPENROUTER_API_KEY", "").strip()
+        return (os.getenv("OPENROUTER_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN") or "").strip()
+
+    @property
+    def _openbio_api_key(self) -> str:
+        return (os.getenv("OPENBIO_API_KEY") or "").strip()
+
+    @staticmethod
+    def _normalize_agent_mode(mode: str) -> str:
+        return "tutor" if str(mode or "").strip().lower() == "tutor" else "work"
+
+    @staticmethod
+    def _normalize_conversation_mode(mode: str) -> str:
+        normalized = str(mode or "").strip().lower()
+        if normalized in _CONVERSATION_MODES:
+            return normalized
+        return "local_first"
+
+    @staticmethod
+    def _new_chat_query_session_id() -> str:
+        return "pymol_chat_%s" % (uuid.uuid4().hex,)
 
     def set_reasoning_visible(self, visible: bool) -> None:
         self.reasoning_visible = bool(visible)
+
+    def set_debug_mode(self, enabled: bool) -> None:
+        active = bool(enabled)
+        self.trace_stream_chunks = active
+        self._sdk_loop.set_trace_stream(active)
+        self._log_ai("debug mode changed", enabled=active)
+
+    def set_agent_mode(self, mode: str) -> None:
+        normalized = self._normalize_agent_mode(mode)
+        self.agent_mode = normalized
+        self._log_ai("agent mode changed", mode=normalized)
 
     def set_ui_mode(self, mode: str) -> None:
         self._ui_mode = mode if mode in ("qt", "text") else "text"
@@ -122,10 +210,41 @@ class AiRuntime:
     def current_input_mode(self) -> str:
         return self.input_mode
 
+    @property
+    def current_agent_mode(self) -> str:
+        return self.agent_mode
+
+    @property
+    def is_busy(self) -> bool:
+        with self._lock:
+            return bool(self._busy)
+
+    @staticmethod
+    def _log_value(value: object, max_len: int = 220) -> str:
+        text = str(value).replace("\n", "\\n")
+        if len(text) > max_len:
+            return text[:max_len] + "...(truncated)"
+        return text
+
+    def _log_ai(self, message: str, level: str = "INFO", **fields) -> None:
+        parts = []
+        for key, value in fields.items():
+            parts.append("%s=%s" % (key, self._log_value(value)))
+        line = "[PyMolAI] %s %s" % (level.upper(), message)
+        if parts:
+            line += " | " + " ".join(parts)
+
+        if self._log_to_terminal:
+            print(line)
+        if self._log_to_python_logger:
+            log_level = getattr(logging, str(level).upper(), logging.INFO)
+            self._logger.log(log_level, line)
+
     def request_cancel(self) -> bool:
         self._cancel_event.set()
         with self._lock:
             busy = bool(self._busy)
+        self._log_ai("cancel requested", busy=busy)
         if busy:
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="cancellation requested..."))
         return busy
@@ -133,18 +252,56 @@ class AiRuntime:
     def clear_session(self, emit_notice: bool = True) -> None:
         self.history.clear()
         self._stream_line_buffer = ""
+        self._stream_full_text = ""
         self._recent_tool_results.clear()
+        self.reset_remote_session_binding(reason="clear_session")
+        self._log_ai("session cleared", emit_notice=emit_notice)
         if emit_notice:
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="session memory cleared"))
+
+    def reset_remote_session_binding(self, reason: str = "") -> None:
+        prev_session_id = self._sdk_session_id
+        prev_query_session_id = self._chat_query_session_id
+        self._sdk_session_id = None
+        self._chat_query_session_id = self._new_chat_query_session_id()
+        self._log_ai(
+            "remote session binding reset",
+            session_reset_reason=reason or "manual",
+            had_session_id=bool(prev_session_id),
+            old_session_id=prev_session_id or "",
+            old_query_session_id=prev_query_session_id,
+            query_session_id=self._chat_query_session_id,
+        )
+
+    def ensure_ai_default_mode(self, emit_notice: bool = False) -> bool:
+        disabled = os.getenv("PYMOL_AI_DISABLE", "").strip() == "1"
+        has_key = bool(self._api_key)
+        self.input_mode = "ai"
+        self.enabled = has_key and not disabled
+        self._log_ai(
+            "ensure default ai mode",
+            enabled=self.enabled,
+            has_key=has_key,
+            disabled=disabled,
+        )
+        if emit_notice and self.enabled:
+            self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="AI enabled"))
+        return self.enabled
 
     def export_session_state(self) -> Dict[str, object]:
         return {
             "input_mode": "cli" if self.input_mode == "cli" else "ai",
-            "history": list(self.history[-80:]),
+            "history": list(self.history[-self.history_max_messages :]),
+            "backend": self._agent_backend,
+            "sdk_session_id": self._sdk_session_id,
+            "conversation_mode": self.conversation_mode,
+            "chat_query_session_id": self._chat_query_session_id,
             "model_info": {
                 "model": self.model,
                 "enabled": bool(self.enabled),
                 "reasoning_visible": bool(self.reasoning_visible),
+                "debug_mode": bool(self.trace_stream_chunks),
+                "agent_mode": self.current_agent_mode,
                 "final_answer_enabled": bool(self.final_answer_enabled),
             },
         }
@@ -152,26 +309,51 @@ class AiRuntime:
     def import_session_state(self, state: Optional[Dict[str, object]], apply_model: bool = False) -> None:
         payload = dict(state or {})
         self._stream_line_buffer = ""
+        self._stream_full_text = ""
 
         mode = "cli" if str(payload.get("input_mode") or "").lower() == "cli" else "ai"
         self.input_mode = mode
+        self._agent_backend = str(payload.get("backend") or "claude_sdk")
+        session_id = str(payload.get("sdk_session_id") or "").strip()
+        self._sdk_session_id = session_id or None
+        self.conversation_mode = self._normalize_conversation_mode(payload.get("conversation_mode") or self.conversation_mode)
+        query_session_id = str(payload.get("chat_query_session_id") or "").strip()
+        self._chat_query_session_id = query_session_id or self._new_chat_query_session_id()
 
         history = payload.get("history") or []
         if isinstance(history, list):
-            self.history = list(history[-80:])
+            self.history = list(history[-self.history_max_messages :])
         else:
             self.history = []
 
-        if apply_model:
-            model_info = payload.get("model_info") or {}
-            if isinstance(model_info, dict):
+        model_info = payload.get("model_info") or {}
+        if isinstance(model_info, dict):
+            if "reasoning_visible" in model_info:
+                self.set_reasoning_visible(bool(model_info.get("reasoning_visible")))
+            if "debug_mode" in model_info:
+                self.set_debug_mode(bool(model_info.get("debug_mode")))
+            if "agent_mode" in model_info:
+                self.set_agent_mode(str(model_info.get("agent_mode") or "work"))
+
+            if apply_model:
                 model = str(model_info.get("model") or "").strip()
                 if model:
                     self.model = model
                 if "enabled" in model_info:
                     self.enabled = bool(model_info.get("enabled"))
-                if "reasoning_visible" in model_info:
-                    self.reasoning_visible = bool(model_info.get("reasoning_visible"))
+        self._log_ai(
+            "session state imported",
+            apply_model=apply_model,
+            input_mode=self.input_mode,
+            history_len=len(self.history),
+            sdk_session_id=bool(self._sdk_session_id),
+            conversation_mode=self.conversation_mode,
+            query_session_id=self._chat_query_session_id,
+            reasoning_visible=self.reasoning_visible,
+            agent_mode=self.agent_mode,
+            debug_mode=self.trace_stream_chunks,
+            enabled=self.enabled,
+        )
 
     def emit_ui_event(self, event: UiEvent) -> None:
         if event.role == UiRole.SYSTEM and self._is_internal_system_reminder(event.text):
@@ -249,6 +431,13 @@ class AiRuntime:
         if not stripped:
             return False
 
+        self._log_ai(
+            "input received",
+            input_mode=self.input_mode,
+            enabled=self.enabled,
+            busy=self._busy,
+            text=stripped,
+        )
         self.emit_ui_event(UiEvent(role=UiRole.USER, text=stripped))
 
         if stripped.startswith("/cli"):
@@ -260,10 +449,12 @@ class AiRuntime:
             return True
 
         if self.input_mode == "cli":
+            self._log_ai("routing to CLI execution", command=raw)
             self._execute_cli_command(raw)
             return True
 
         if not self.enabled:
+            self._log_ai("ai request rejected: disabled", level="WARNING", text=raw)
             self.emit_ui_event(
                 UiEvent(
                     role=UiRole.ERROR,
@@ -281,16 +472,12 @@ class AiRuntime:
             return call(fn)
         return fn()
 
-    def _client_or_error(self) -> OpenRouterClient:
-        if self._client is None:
-            self._client = OpenRouterClient(api_key=self._api_key)
-        return self._client
-
     def _handle_cli_control(self, command: str) -> None:
         rest = command[len("/cli") :].strip()
 
         if not rest or rest == "on":
             self.input_mode = "cli"
+            self._log_ai("cli mode enabled")
             self.emit_ui_event(
                 UiEvent(role=UiRole.SYSTEM, text="CLI mode enabled. Commands are executed directly")
             )
@@ -298,6 +485,7 @@ class AiRuntime:
 
         if rest == "off":
             self.input_mode = "ai"
+            self._log_ai("cli mode disabled; ai mode selected")
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="AI mode enabled"))
             return
 
@@ -307,19 +495,40 @@ class AiRuntime:
 
         self._execute_cli_command(rest)
 
+    def _enable_ai(self) -> bool:
+        if not self._api_key:
+            self.enabled = False
+            self._log_ai("failed to enable AI: missing API key", level="ERROR")
+            self.emit_ui_event(
+                UiEvent(
+                    role=UiRole.ERROR,
+                    text="OPENROUTER_API_KEY (or ANTHROPIC_AUTH_TOKEN) is not set. Export it and retry /ai on",
+                )
+            )
+            return False
+        if os.getenv("PYMOL_AI_DISABLE", "").strip() == "1":
+            self.enabled = False
+            self._log_ai("failed to enable AI: PYMOL_AI_DISABLE=1", level="ERROR")
+            self.emit_ui_event(UiEvent(role=UiRole.ERROR, text="PYMOL_AI_DISABLE=1 is set. Unset it to enable AI"))
+            return False
+        self.enabled = True
+        self.input_mode = "ai"
+        self._log_ai("ai enabled", model=self.model)
+        self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="AI enabled"))
+        return True
+
     def _handle_ai_control(self, command: str) -> None:
         parts = command.split()
 
         if len(parts) == 1:
-            self.input_mode = "ai"
-            self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="AI mode enabled"))
+            self._enable_ai()
             return
 
         if parts[1].lower() == "help":
             self.emit_ui_event(
                 UiEvent(
                     role=UiRole.SYSTEM,
-                    text="/ai (switch to AI mode) | /ai on | /ai off | /ai model <id> | /ai clear | /ai help",
+                    text="/ai (same as /ai on) | /ai on | /ai off | /ai model <id> | /ai clear | /ai help",
                 )
             )
             return
@@ -327,23 +536,12 @@ class AiRuntime:
         action = parts[1].lower()
 
         if action == "on":
-            if not self._api_key:
-                self.enabled = False
-                self.emit_ui_event(
-                    UiEvent(role=UiRole.ERROR, text="OPENROUTER_API_KEY is not set. Export it and retry /ai on")
-                )
-                return
-            if os.getenv("PYMOL_AI_DISABLE", "").strip() == "1":
-                self.enabled = False
-                self.emit_ui_event(UiEvent(role=UiRole.ERROR, text="PYMOL_AI_DISABLE=1 is set. Unset it to enable AI"))
-                return
-            self.enabled = True
-            self.input_mode = "ai"
-            self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="AI enabled"))
+            self._enable_ai()
             return
 
         if action == "off":
             self.enabled = False
+            self._log_ai("ai disabled via /ai off")
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="AI disabled"))
             return
 
@@ -352,6 +550,7 @@ class AiRuntime:
                 self.emit_ui_event(UiEvent(role=UiRole.ERROR, text="usage: /ai model <openrouter_model_id>"))
                 return
             self.model = parts[2]
+            self._log_ai("ai model changed", model=self.model)
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="model set to %s" % (self.model,)))
             return
 
@@ -364,10 +563,18 @@ class AiRuntime:
     def _start_agent_request(self, prompt: str) -> None:
         with self._lock:
             if self._busy:
+                self._log_ai("request skipped because worker is busy", level="WARNING")
                 self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="request already in progress"))
                 return
             self._busy = True
             self._cancel_event.clear()
+        self._log_ai(
+            "starting ai worker",
+            prompt=prompt,
+            resume_session_id=self._sdk_session_id or "",
+            conversation_mode=self.conversation_mode,
+            query_session_id=self._chat_query_session_id,
+        )
 
         thread = threading.Thread(
             target=self._agent_worker,
@@ -379,8 +586,62 @@ class AiRuntime:
 
     def _append_history(self, message: Dict[str, object]) -> None:
         self.history.append(message)
-        if len(self.history) > 80:
-            self.history = self.history[-80:]
+        if len(self.history) > self.history_max_messages:
+            self.history = self.history[-self.history_max_messages :]
+
+    def _format_history_entry(self, message: Dict[str, object]) -> str:
+        role = str(message.get("role") or "").strip()
+        if role in ("user", "assistant", "system"):
+            content = str(message.get("content") or "").strip()
+            if not content:
+                return ""
+            if role == "system" and self._is_internal_system_reminder(content):
+                return ""
+            return "%s: %s" % (role, content)
+
+        if role == "tool":
+            name = str(message.get("name") or "tool").strip() or "tool"
+            content = str(message.get("content") or "").strip()
+            if not content:
+                return ""
+            return "tool[%s]: %s" % (name, content)
+
+        return ""
+
+    def _history_context_lines(self) -> list[str]:
+        if not self.history:
+            return []
+
+        entries = []
+        for message in self.history[-self.history_max_messages :]:
+            line = self._format_history_entry(message)
+            if not line:
+                continue
+            if len(line) > 1200:
+                line = line[:1200] + "... [truncated]"
+            entries.append(line)
+
+        if not entries:
+            return []
+
+        selected_rev = []
+        used = 0
+        for line in reversed(entries):
+            line_len = len(line) + 1
+            if selected_rev and used + line_len > self.history_max_chars:
+                break
+            if not selected_rev and line_len > self.history_max_chars:
+                keep = max(40, self.history_max_chars - 20)
+                line = line[:keep] + "... [truncated]"
+                line_len = len(line) + 1
+            selected_rev.append(line)
+            used += line_len
+
+        selected = list(reversed(selected_rev))
+        omitted = len(entries) - len(selected)
+        if omitted > 0:
+            selected.insert(0, "[%d older context entries omitted]" % (omitted,))
+        return selected
 
     def _state_summary_for_prompt(self) -> Dict[str, object]:
         return self._run_in_gui(
@@ -392,88 +653,53 @@ class AiRuntime:
             )
         )
 
-    def _build_messages(
-        self,
-        prompt: str,
-        *,
-        snapshot_image_data_url: Optional[str] = None,
-        snapshot_state_summary: Optional[Dict[str, object]] = None,
-    ) -> List[Dict[str, object]]:
-        state_summary = snapshot_state_summary or self._state_summary_for_prompt()
+    def _build_system_prompt(self) -> str:
+        mode = self._normalize_agent_mode(self.agent_mode)
+        overlay = SYSTEM_PROMPT_TUTOR_OVERLAY if mode == "tutor" else SYSTEM_PROMPT_WORK_OVERLAY
+        return SYSTEM_PROMPT_BASE + "\n" + overlay
 
-        msgs: List[Dict[str, object]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "system",
-                "content": "Current viewer state (compact JSON):\n%s"
-                % (json.dumps(state_summary, ensure_ascii=False),),
-            },
+    def _build_turn_prompt(self, prompt: str, *, include_history_context: bool) -> str:
+        state_summary = self._state_summary_for_prompt()
+        lines = [
+            "Current viewer state (compact JSON):",
+            json.dumps(state_summary, ensure_ascii=False),
         ]
-        msgs.extend(self.history[-60:])
 
-        if snapshot_image_data_url:
-            msgs.append(
-                {
-                    "role": "user",
-                    "content": build_multimodal_user_content(
-                        "Visual validation context for current viewer state.",
-                        snapshot_image_data_url,
-                    ),
-                }
-            )
+        if include_history_context:
+            context_lines = self._history_context_lines()
+            if context_lines:
+                lines.append("")
+                lines.append("Conversation context:")
+                lines.extend(context_lines)
 
-        msgs.append({"role": "user", "content": prompt})
-        return msgs
-
-    def _agent_tools(self) -> List[Dict[str, object]]:
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": "run_pymol_command",
-                    "description": "Run a single PyMOL command in the current session.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "command": {"type": "string"},
-                            "rationale": {"type": "string"},
-                        },
-                        "required": ["command"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "capture_viewer_snapshot",
-                    "description": (
-                        "Capture current PyMOL viewport screenshot and compact viewer state summary. "
-                        "Use ONLY for internal visual validation before final answer when scene changed. "
-                        "Do not claim this screenshot is shown to the user."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "purpose": {"type": "string"},
-                        },
-                        "required": [],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-        ]
+        lines.append("")
+        lines.append("User request:")
+        lines.append(str(prompt or ""))
+        return "\n".join(lines)
 
     def _on_assistant_chunk(self, chunk: str) -> None:
         if self._cancel_event.is_set():
             return
-        if chunk:
-            self._stream_had_output = True
-        self._stream_line_buffer += chunk
-        while "\n" in self._stream_line_buffer:
-            line, self._stream_line_buffer = self._stream_line_buffer.split("\n", 1)
-            if line.strip():
-                self.emit_ui_event(UiEvent(role=UiRole.AI, text=line.strip()))
+        piece = str(chunk or "")
+        if not piece:
+            return
+        self._stream_had_output = True
+        self._stream_full_text += piece
+        if self.trace_stream_chunks:
+            self._log_ai(
+                "stream chunk",
+                level="DEBUG",
+                chars=len(piece),
+                preview=piece[:120],
+            )
+        self.emit_ui_event(UiEvent(role=UiRole.AI, text=piece, metadata={"stream_chunk": True}))
+
+    def _on_assistant_message_boundary(self) -> None:
+        if self._cancel_event.is_set():
+            return
+        if self.trace_stream_chunks:
+            self._log_ai("stream message boundary", level="DEBUG")
+        self.emit_ui_event(UiEvent(role=UiRole.AI, text="", metadata={"stream_boundary": True}))
 
     def _flush_assistant_chunks(self) -> None:
         if self._stream_line_buffer.strip():
@@ -514,8 +740,16 @@ class AiRuntime:
         if note:
             self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text=note))
 
+        self._log_ai("executing cli command", command=fixed)
         self._append_history({"role": "user", "content": "CLI command: %s" % (fixed,)})
         result = self._run_in_gui(lambda c=fixed: run_pymol_command(self.cmd, c))
+        self._log_ai(
+            "cli command finished",
+            command=result.command,
+            ok=result.ok,
+            error=result.error or "",
+            feedback_lines=len(result.feedback_lines or []),
+        )
         self._remember_tool_result(result.command, result.ok, result.error)
         payload = {
             "ok": result.ok,
@@ -538,18 +772,6 @@ class AiRuntime:
             )
         )
 
-    def _assistant_message_with_tools(self, assistant_text: str, tool_calls: List[ToolCall]) -> Dict[str, object]:
-        tc_payload = []
-        for tc in tool_calls:
-            tc_payload.append(
-                {
-                    "id": tc.tool_call_id,
-                    "type": "function",
-                    "function": {"name": tc.name, "arguments": tc.arguments_json},
-                }
-            )
-        return {"role": "assistant", "content": assistant_text, "tool_calls": tc_payload}
-
     def _tool_result_content(self, payload: Dict[str, object]) -> str:
         return json.dumps(payload, ensure_ascii=False)
 
@@ -565,6 +787,20 @@ class AiRuntime:
     @staticmethod
     def _normalized_command_key(command: str) -> str:
         return re.sub(r"\s+", " ", str(command or "").strip().lower())
+
+    @staticmethod
+    def _normalize_sdk_tool_name(raw_name: str) -> Tuple[str, str]:
+        name = str(raw_name or "").strip()
+        if not name:
+            return "", ""
+        # Claude Agent SDK MCP tool names can come back as:
+        # mcp__<server_name>__<tool_name>
+        if name.startswith("mcp__"):
+            parts = name.split("__")
+            if len(parts) >= 3 and parts[-1]:
+                canonical = parts[-1].strip()
+                return canonical, canonical
+        return name, name
 
     def _execute_snapshot_tool(self) -> Tuple[Dict[str, object], Optional[str], Dict[str, object]]:
         capture = self._run_in_gui(
@@ -589,13 +825,7 @@ class AiRuntime:
         return payload, image_data_url, state_summary
 
     def _agent_worker(self, prompt: str) -> None:
-        detector = DoomLoopDetector(threshold=self.doom_loop_threshold)
-
-        snapshot_image_data_url: Optional[str] = None
-        snapshot_state_summary: Optional[Dict[str, object]] = None
         cancelled = False
-        successful_commands_this_turn = set()
-        loop_nudged_at_step = 0
 
         def is_cancelled() -> bool:
             return self._cancel_event.is_set()
@@ -609,300 +839,434 @@ class AiRuntime:
                 cancelled = True
             return True
 
-        def maybe_handle_stall(loop: Dict[str, object], step_index: int) -> bool:
-            nonlocal loop_nudged_at_step
-            if not loop:
-                return False
-
-            if loop_nudged_at_step == 0:
-                loop_type = str(loop.get("loop_type") or "stall")
-                family = str(loop.get("command_family") or "").strip()
-                hidden = (
-                    "DOOM LOOP DETECTED: %s%s. Stop repeating the same setup phrasing. "
-                    "Switch approach or ask the user to clarify target selection."
-                    % (loop_type, (" (%s)" % family) if family else "")
-                )
-                self._append_history({"role": "system", "content": hidden})
-                loop_nudged_at_step = step_index
-                return False
-
-            if step_index <= loop_nudged_at_step:
-                return False
-
-            stuck = "I'm stuck; please narrow or clarify the target selection."
-            self.emit_ui_event(UiEvent(role=UiRole.ERROR, text=stuck))
-            self._append_history({"role": "assistant", "content": stuck})
-            return True
-
         try:
+            self._log_ai("agent turn started", prompt=prompt)
             if check_cancel():
                 return
+
             self._append_history({"role": "user", "content": prompt})
+            self._stream_had_output = False
+            self._stream_line_buffer = ""
+            self._stream_full_text = ""
 
             pending_validation_required = False
             validation_done_this_turn = False
             slow_tool_notice_emitted = False
+            snapshot_state_summary: Optional[Dict[str, object]] = None
 
-            for step in range(1, self.max_agent_steps + 1):
-                if check_cancel():
+            def maybe_emit_slow_tool_warning(elapsed: float) -> None:
+                nonlocal slow_tool_notice_emitted
+                if self.long_tool_warn_sec < 0:
                     return
+                if elapsed < self.long_tool_warn_sec:
+                    return
+                if slow_tool_notice_emitted:
+                    return
+                self.emit_ui_event(
+                    UiEvent(
+                        role=UiRole.SYSTEM,
+                        text=(
+                            "tool step took %.1fs; UI may be busy during heavy PyMOL operations"
+                            % (elapsed,)
+                        ),
+                    )
+                )
+                self._log_ai("slow tool warning emitted", elapsed="%.3f" % (elapsed,))
+                slow_tool_notice_emitted = True
 
-                messages = self._build_messages(
-                    prompt,
-                    snapshot_image_data_url=snapshot_image_data_url,
-                    snapshot_state_summary=snapshot_state_summary,
+            def execute_run_command_tool(tool_call_id: str, tool_args: Dict[str, object]) -> Dict[str, object]:
+                nonlocal pending_validation_required
+                command = str(tool_args.get("command") or "").strip()
+                command, note = self._canonicalize_command(command)
+                if note:
+                    self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text=note))
+
+                self._log_ai("tool run start", tool_call_id=tool_call_id, command=command)
+                started = time.monotonic()
+                exec_result = self._run_in_gui(lambda c=command: run_pymol_command(self.cmd, c))
+                elapsed = time.monotonic() - started
+                maybe_emit_slow_tool_warning(elapsed)
+                self._log_ai(
+                    "tool run done",
+                    tool_call_id=tool_call_id,
+                    command=exec_result.command,
+                    ok=exec_result.ok,
+                    elapsed="%.3f" % (elapsed,),
+                    error=exec_result.error or "",
                 )
 
-                # Ephemeral image: use for immediate call and then clear.
-                snapshot_image_data_url = None
+                self._remember_tool_result(exec_result.command, exec_result.ok, exec_result.error)
+                payload = {
+                    "ok": exec_result.ok,
+                    "command": exec_result.command,
+                    "error": exec_result.error or None,
+                    "feedback_lines": exec_result.feedback_lines,
+                }
+                metadata = {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": "run_pymol_command",
+                    "tool_args": dict(tool_args or {}),
+                    "tool_command": command,
+                    "tool_result_json": self._tool_result_metadata_payload(payload),
+                }
+                self.emit_ui_event(
+                    UiEvent(
+                        role=UiRole.TOOL_RESULT,
+                        text="Executed: %s" % (command,),
+                        ok=bool(payload.get("ok")),
+                        metadata=metadata,
+                    )
+                )
 
-                self._stream_had_output = False
-                turn = self._client_or_error().stream_assistant_turn(
+                msg_content = self._tool_result_content(payload)
+                if len(msg_content) > self.tool_result_max_chars:
+                    msg_content = msg_content[: self.tool_result_max_chars] + "... [truncated]"
+                self._append_history(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": "run_pymol_command",
+                        "content": msg_content,
+                    }
+                )
+
+                if self._is_state_changing_command(str(payload.get("command") or command)):
+                    pending_validation_required = True
+
+                return payload
+
+            def execute_snapshot_tool(tool_call_id: str, tool_args: Dict[str, object]) -> Dict[str, object]:
+                nonlocal pending_validation_required, validation_done_this_turn, snapshot_state_summary
+                self._log_ai("snapshot tool start", tool_call_id=tool_call_id, args=tool_args)
+                started = time.monotonic()
+                payload, image_data_url, state_summary = self._execute_snapshot_tool()
+                elapsed = time.monotonic() - started
+                maybe_emit_slow_tool_warning(elapsed)
+                self._log_ai(
+                    "snapshot tool done",
+                    tool_call_id=tool_call_id,
+                    ok=bool(payload.get("ok")),
+                    elapsed="%.3f" % (elapsed,),
+                    error=payload.get("error") or "",
+                )
+
+                snapshot_state_summary = state_summary
+                metadata = {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": "capture_viewer_snapshot",
+                    "tool_args": dict(tool_args or {}),
+                    "tool_command": None,
+                    "tool_result_json": self._tool_result_metadata_payload(payload),
+                }
+                if payload["ok"]:
+                    metadata["visual_validation"] = "validated: screenshot+state"
+                else:
+                    metadata["visual_validation"] = "validated: state-only (screenshot failed)"
+
+                self.emit_ui_event(
+                    UiEvent(
+                        role=UiRole.TOOL_RESULT,
+                        text="Executed: capture_viewer_snapshot",
+                        ok=bool(payload.get("ok")),
+                        metadata=metadata,
+                    )
+                )
+
+                self._append_history(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": "capture_viewer_snapshot",
+                        "content": self._tool_result_content(payload),
+                    }
+                )
+
+                validation_done_this_turn = True
+                pending_validation_required = False
+                return {
+                    "payload": payload,
+                    "image_data_url": image_data_url,
+                }
+
+            def execute_openbio_api_tool(
+                tool_call_id: str,
+                tool_name: str,
+                tool_args: Dict[str, object],
+            ) -> Dict[str, object]:
+                payload_args = dict(tool_args or {})
+                resolved_name = str(tool_name or "").strip()
+                self._log_ai(
+                    "openbio tool start",
+                    tool_call_id=tool_call_id,
+                    tool_name=resolved_name,
+                    args=payload_args,
+                )
+                started = time.monotonic()
+                payload = execute_openbio_api_gateway_tool(
+                    resolved_name,
+                    payload_args,
+                    working_dir=os.path.realpath(os.getcwd()),
+                )
+                elapsed = time.monotonic() - started
+                maybe_emit_slow_tool_warning(elapsed)
+                self._log_ai(
+                    "openbio tool done",
+                    tool_call_id=tool_call_id,
+                    tool_name=resolved_name,
+                    ok=bool(payload.get("ok")),
+                    elapsed="%.3f" % (elapsed,),
+                    error=payload.get("error") or "",
+                )
+
+                metadata = {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": resolved_name or "openbio_api_tool",
+                    "tool_args": payload_args,
+                    "tool_command": None,
+                    "tool_result_json": self._tool_result_metadata_payload(payload),
+                }
+                self.emit_ui_event(
+                    UiEvent(
+                        role=UiRole.TOOL_RESULT,
+                        text="Executed: %s" % (resolved_name or "openbio_api_tool",),
+                        ok=bool(payload.get("ok")),
+                        metadata=metadata,
+                    )
+                )
+
+                content = self._tool_result_content(payload)
+                if len(content) > self.tool_result_max_chars:
+                    content = content[: self.tool_result_max_chars] + "... [truncated]"
+                self._append_history(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": resolved_name or "openbio_api_tool",
+                        "content": content,
+                    }
+                )
+                return payload
+
+            def execute_external_tool_result(
+                tool_call_id: str,
+                tool_name: str,
+                tool_args: Dict[str, object],
+                tool_output: object,
+                tool_error_flag: Optional[bool],
+            ) -> None:
+                raw_tool_name = str(tool_name or "").strip()
+                canonical_name, display_name = self._normalize_sdk_tool_name(raw_tool_name)
+                normalized = canonical_name or raw_tool_name
+                if normalized in ("run_pymol_command", "capture_viewer_snapshot") or normalized.startswith("openbio_api_"):
+                    self._log_ai(
+                        "ignored mirrored internal mcp tool result",
+                        level="DEBUG",
+                        tool_call_id=tool_call_id,
+                        tool_name_raw=raw_tool_name,
+                        canonical_name=normalized,
+                    )
+                    return
+
+                args_payload = dict(tool_args or {})
+                command = ""
+                if normalized == "Bash":
+                    command = str(args_payload.get("command") or "").strip()
+                if not command:
+                    command = display_name or normalized or "tool"
+
+                ok = not bool(tool_error_flag)
+                payload = {
+                    "ok": ok,
+                    "tool_name": display_name or normalized or "tool",
+                    "tool_args": args_payload,
+                    "result": tool_output,
+                    "is_error": bool(tool_error_flag),
+                }
+
+                self._log_ai(
+                    "external tool result",
+                    tool_call_id=tool_call_id,
+                    tool_name=display_name or normalized or "tool",
+                    tool_name_raw=raw_tool_name,
+                    command=command,
+                    ok=ok,
+                )
+                self.emit_ui_event(
+                    UiEvent(
+                        role=UiRole.TOOL_RESULT,
+                        text="Executed: %s" % (command,),
+                        ok=ok,
+                        metadata={
+                            "tool_call_id": tool_call_id or "external_tool",
+                            "tool_name": display_name or normalized or "tool",
+                            "tool_name_raw": raw_tool_name or None,
+                            "tool_args": args_payload,
+                            "tool_command": command if normalized == "Bash" else None,
+                            "tool_result_json": self._tool_result_metadata_payload(payload),
+                        },
+                    )
+                )
+
+                content = self._tool_result_content(payload)
+                if len(content) > self.tool_result_max_chars:
+                    content = content[: self.tool_result_max_chars] + "... [truncated]"
+                self._append_history(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id or "external_tool",
+                        "name": display_name or normalized or "tool",
+                        "content": content,
+                    }
+                )
+
+            def run_sdk_turn(
+                request_prompt: str,
+                resume_session_id: Optional[str],
+                include_history_context: bool,
+                session_reset_reason: str = "",
+            ):
+                return self._sdk_loop.run_turn(
+                    prompt=request_prompt,
                     model=self.model,
-                    messages=messages,
-                    tools=self._agent_tools(),
+                    system_prompt=self._build_system_prompt(),
+                    max_turns=self.max_agent_steps,
+                    resume_session_id=resume_session_id,
+                    query_session_id=self._chat_query_session_id,
                     on_text_chunk=self._on_assistant_chunk,
+                    on_message_boundary=self._on_assistant_message_boundary,
                     on_reasoning_chunk=(
                         (lambda t: self.reasoning_visible and self.emit_ui_event(UiEvent(role=UiRole.REASONING, text=t)))
                     ),
+                    on_tool_result=execute_external_tool_result,
                     should_cancel=is_cancelled,
+                    run_command_tool=execute_run_command_tool,
+                    snapshot_tool=execute_snapshot_tool,
+                    openbio_api_tool=(
+                        execute_openbio_api_tool
+                        if self._openbio_api_key
+                        else None
+                    ),
+                    max_buffer_size=self.sdk_max_buffer_size or None,
+                    conversation_mode=self.conversation_mode,
+                    include_history_context=include_history_context,
+                    session_reset_reason=session_reset_reason,
                 )
-                if check_cancel():
+
+            include_history_context = self.conversation_mode == "local_first"
+            resume_session_id: Optional[str] = None
+            if self.conversation_mode in ("hybrid_resume", "resume_only"):
+                resume_session_id = self._sdk_session_id
+            if self.conversation_mode == "hybrid_resume" and not resume_session_id:
+                include_history_context = True
+            if self.conversation_mode == "resume_only":
+                include_history_context = False
+
+            turn_prompt = self._build_turn_prompt(prompt, include_history_context=include_history_context)
+            self._log_ai(
+                "sdk turn run",
+                include_history_context=include_history_context,
+                resume_session_id=resume_session_id or "",
+                max_turns=self.max_agent_steps,
+                model=self.model,
+                conversation_mode=self.conversation_mode,
+                query_session_id=self._chat_query_session_id,
+            )
+            result = run_sdk_turn(turn_prompt, resume_session_id, include_history_context)
+
+            if result.error_class == "resume_invalid" and not check_cancel():
+                self.reset_remote_session_binding(reason="resume_invalid")
+                turn_prompt = self._build_turn_prompt(prompt, include_history_context=True)
+                self._log_ai(
+                    "sdk resume invalid; retrying with local history context",
+                    conversation_mode=self.conversation_mode,
+                    query_session_id=self._chat_query_session_id,
+                )
+                result = run_sdk_turn(
+                    turn_prompt,
+                    None,
+                    True,
+                    session_reset_reason="resume_invalid",
+                )
+
+            if check_cancel():
+                return
+
+            self._flush_assistant_chunks()
+
+            if result.error:
+                if result.error_class == "cancelled":
+                    check_cancel()
                     return
+                if result.error_class == "resume_invalid":
+                    self.reset_remote_session_binding(reason="resume_invalid_terminal")
+                self._log_ai(
+                    "sdk turn completed",
+                    error_class=result.error_class or "",
+                    has_error=True,
+                    session_id=result.session_id or self._sdk_session_id or "",
+                    query_session_id=self._chat_query_session_id,
+                )
+                self._log_ai("sdk turn failed", level="ERROR", error=result.error, error_class=result.error_class or "")
+                self.emit_ui_event(UiEvent(role=UiRole.ERROR, text=str(result.error)))
+                return
 
-                self._flush_assistant_chunks()
+            self._sdk_session_id = result.session_id or self._sdk_session_id
+            self._log_ai(
+                "sdk turn completed",
+                error_class=result.error_class or "",
+                has_error=False,
+                session_id=self._sdk_session_id or "",
+                query_session_id=self._chat_query_session_id,
+            )
 
-                assistant_text = str(turn.get("assistant_text") or "").strip()
-                tool_calls = list(turn.get("tool_calls") or [])
-                intent_loop = detector.add_assistant_intent(assistant_text)
-                if maybe_handle_stall(intent_loop, step):
-                    return
+            if self.screenshot_validate_required and pending_validation_required and not validation_done_this_turn:
+                execute_snapshot_tool("auto_capture_viewer_snapshot_1", {"purpose": "auto_validation"})
 
-                if not tool_calls:
-                    if self.screenshot_validate_required and pending_validation_required and not validation_done_this_turn:
-                        nudge = (
-                            "Validation required: capture_viewer_snapshot must be called before final answer "
-                            "because scene-changing commands were executed."
-                        )
-                        self._append_history({"role": "system", "content": nudge})
-                        continue
-
-                    # Avoid duplicate final answer if already streamed.
-                    if assistant_text:
-                        if not self._stream_had_output:
-                            self.emit_ui_event(UiEvent(role=UiRole.AI, text=assistant_text))
-                    elif self.final_answer_enabled:
-                        self.emit_ui_event(
-                            UiEvent(
-                                role=UiRole.ERROR,
-                                text="I completed the loop but did not receive a final answer from the model.",
-                            )
-                        )
-                    self._append_history({"role": "assistant", "content": assistant_text})
-                    return
-
-                self._append_history(self._assistant_message_with_tools(assistant_text, tool_calls))
-
-                validation_done_this_turn = False
-
-                for tc in tool_calls:
-                    if check_cancel():
-                        return
-
-                    if tc.name == "capture_viewer_snapshot":
-                        started = time.monotonic()
-                        payload, image_data_url, state_summary = self._execute_snapshot_tool()
-                        elapsed = time.monotonic() - started
-                        snapshot_image_data_url = image_data_url
-                        snapshot_state_summary = state_summary
-
-                        meta = {
-                            "tool_call_id": tc.tool_call_id,
-                            "tool_name": tc.name,
-                            "tool_args": tc.arguments,
-                            "tool_command": None,
-                            "tool_result_json": self._tool_result_metadata_payload(payload),
-                        }
-                        if payload["ok"]:
-                            meta["visual_validation"] = "validated: screenshot+state"
-                            self.emit_ui_event(
-                                UiEvent(
-                                    role=UiRole.TOOL_RESULT,
-                                    text="Executed: capture_viewer_snapshot",
-                                    ok=True,
-                                    metadata=meta,
-                                )
-                            )
-                        else:
-                            meta["visual_validation"] = "validated: state-only (screenshot failed)"
-                            self.emit_ui_event(
-                                UiEvent(
-                                    role=UiRole.TOOL_RESULT,
-                                    text="Executed: capture_viewer_snapshot",
-                                    ok=False,
-                                    metadata=meta,
-                                )
-                            )
-                        if self.long_tool_warn_sec >= 0 and elapsed >= self.long_tool_warn_sec and not slow_tool_notice_emitted:
-                            self.emit_ui_event(
-                                UiEvent(
-                                    role=UiRole.SYSTEM,
-                                    text=(
-                                        "tool step took %.1fs; UI may be busy during heavy PyMOL operations"
-                                        % (elapsed,)
-                                    ),
-                                )
-                            )
-                            slow_tool_notice_emitted = True
-
-                        content = self._tool_result_content(payload)
-                        tool_msg = {
-                            "role": "tool",
-                            "tool_call_id": tc.tool_call_id,
-                            "name": tc.name,
-                            "content": content,
-                        }
-                        self._append_history(tool_msg)
-                        validation_done_this_turn = True
-                        pending_validation_required = False
-                        continue
-
-                    if tc.name != "run_pymol_command":
-                        payload = {
-                            "ok": False,
-                            "command": "",
-                            "error": "unsupported tool: %s" % (tc.name,),
-                            "feedback_lines": [],
-                        }
-                        err_content = self._tool_result_content(payload)
-                        self.emit_ui_event(
-                            UiEvent(
-                                role=UiRole.TOOL_RESULT,
-                                text="Executed: %s" % (tc.name,),
-                                ok=False,
-                                metadata={
-                                    "tool_call_id": tc.tool_call_id,
-                                    "tool_name": tc.name,
-                                    "tool_args": tc.arguments,
-                                    "tool_command": None,
-                                    "tool_result_json": self._tool_result_metadata_payload(payload),
-                                },
-                            )
-                        )
-                        tool_msg = {
-                            "role": "tool",
-                            "tool_call_id": tc.tool_call_id,
-                            "name": tc.name,
-                            "content": err_content,
-                        }
-                        self._append_history(tool_msg)
-                        continue
-
-                    command = str(tc.arguments.get("command") or "").strip()
-                    command, note = self._canonicalize_command(command)
-                    if note:
-                        self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text=note))
-
-                    command_key = self._normalized_command_key(command)
-                    if command_key in successful_commands_this_turn:
-                        payload = {
-                            "ok": True,
-                            "command": command,
-                            "error": None,
-                            "feedback_lines": [],
-                            "skipped": True,
-                            "skip_reason": "duplicate command skipped in current turn",
-                        }
-                    else:
-                        started = time.monotonic()
-                        exec_result = self._run_in_gui(lambda c=command: run_pymol_command(self.cmd, c))
-                        elapsed = time.monotonic() - started
-                        self._remember_tool_result(exec_result.command, exec_result.ok, exec_result.error)
-                        if check_cancel():
-                            return
-                        payload = {
-                            "ok": exec_result.ok,
-                            "command": exec_result.command,
-                            "error": exec_result.error or None,
-                            "feedback_lines": exec_result.feedback_lines,
-                        }
-                        if exec_result.ok:
-                            successful_commands_this_turn.add(command_key)
-                        if self.long_tool_warn_sec >= 0 and elapsed >= self.long_tool_warn_sec and not slow_tool_notice_emitted:
-                            self.emit_ui_event(
-                                UiEvent(
-                                    role=UiRole.SYSTEM,
-                                    text=(
-                                        "tool step took %.1fs; UI may be busy during heavy PyMOL operations"
-                                        % (elapsed,)
-                                    ),
-                                )
-                            )
-                            slow_tool_notice_emitted = True
-
-                    result_text = self._tool_result_content(payload)
+            assistant_text = str(result.assistant_text or "").strip()
+            if assistant_text:
+                self._log_ai("assistant final text emitted", chars=len(assistant_text))
+                if not self._stream_had_output:
+                    self.emit_ui_event(UiEvent(role=UiRole.AI, text=assistant_text))
+                self._append_history({"role": "assistant", "content": assistant_text})
+            elif self._stream_had_output and self._stream_full_text.strip():
+                streamed_text = self._stream_full_text.strip()
+                self._log_ai("assistant final text inferred from streamed chunks", chars=len(streamed_text))
+                self._append_history({"role": "assistant", "content": streamed_text})
+            elif self.final_answer_enabled:
+                turns_used = result.num_turns if isinstance(result.num_turns, int) else None
+                max_turns_hit = turns_used is not None and turns_used >= self.max_agent_steps
+                if max_turns_hit:
+                    self._log_ai(
+                        "sdk turn reached iteration cap without final answer",
+                        level="WARNING",
+                        num_turns=turns_used,
+                        max_turns=self.max_agent_steps,
+                    )
                     self.emit_ui_event(
                         UiEvent(
-                            role=UiRole.TOOL_RESULT,
-                            text="Executed: %s" % (command,),
-                            ok=bool(payload.get("ok")),
-                            metadata={
-                                "tool_call_id": tc.tool_call_id,
-                                "tool_name": tc.name,
-                                "tool_args": tc.arguments,
-                                "tool_command": command,
-                                "tool_result_json": self._tool_result_metadata_payload(payload),
-                            },
+                            role=UiRole.SYSTEM,
+                            text=(
+                                "I reached this turn's iteration limit before producing a final answer. "
+                                "Tell me to continue and I will pick up from here."
+                            ),
                         )
                     )
-
-                    msg_content = result_text
-                    if len(msg_content) > self.tool_result_max_chars:
-                        msg_content = msg_content[: self.tool_result_max_chars] + "... [truncated]"
-
-                    tool_msg = {
-                        "role": "tool",
-                        "tool_call_id": tc.tool_call_id,
-                        "name": tc.name,
-                        "content": msg_content,
-                    }
-                    self._append_history(tool_msg)
-
-                    if self._is_state_changing_command(str(payload.get("command") or command)):
-                        pending_validation_required = True
-
-                    loop = detector.add_call(
-                        tc.name,
-                        tc.arguments,
-                        validation_required=pending_validation_required,
+                else:
+                    self._log_ai("missing final assistant answer from sdk", level="ERROR")
+                    self.emit_ui_event(
+                        UiEvent(
+                            role=UiRole.ERROR,
+                            text="I completed the loop but did not receive a final answer from the model.",
+                        )
                     )
-                    if maybe_handle_stall(loop, step):
-                        return
-
-                # If tools executed and validation required but not done, nudge immediately.
-                if self.screenshot_validate_required and pending_validation_required and not validation_done_this_turn:
-                    nudge = (
-                        "Visual validation required now: call capture_viewer_snapshot before final answer."
-                    )
-                    self._append_history({"role": "system", "content": nudge})
-
-            self.emit_ui_event(
-                UiEvent(
-                    role=UiRole.ERROR,
-                    text=(
-                        "Agent reached step limit (%d). Please refine your request or use /cli for direct commands."
-                        % (self.max_agent_steps,)
-                    ),
-                )
-            )
-        except OpenRouterClientError as exc:
-            self.emit_ui_event(UiEvent(role=UiRole.ERROR, text=str(exc)))
         except Exception as exc:  # noqa: BLE001
+            self._log_ai("unexpected runtime exception", level="ERROR", error=exc)
             self.emit_ui_event(UiEvent(role=UiRole.ERROR, text="unexpected error: %s" % (exc,)))
         finally:
             with self._lock:
                 self._busy = False
             self._cancel_event.clear()
+            self._log_ai("agent turn finished", cancelled=cancelled)
 
 
 def get_ai_runtime(cmd, create: bool = True) -> Optional[AiRuntime]:

@@ -32,14 +32,23 @@ class AutoHeightTextBrowser(QtWidgets.QTextBrowser):
         self.setFrameShape(QtWidgets.QFrame.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setLineWrapMode(QtWidgets.QTextEdit.WidgetWidth)
+        self.setWordWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
         self.setOpenExternalLinks(True)
+        self.setMinimumWidth(0)
         self.document().setDocumentMargin(0)
+        self.document().setDefaultStyleSheet("pre, code { white-space: pre-wrap; }")
         self.document().contentsChanged.connect(self._sync_height)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._sync_height()
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(80)
+        return hint
 
     def _sync_height(self):
         width = max(100, self.viewport().width())
@@ -58,6 +67,8 @@ class MessageBubble(QtWidgets.QFrame):
 
         self.setObjectName("chatBubble")
         self.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
+        self.setMinimumWidth(0)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
@@ -65,11 +76,14 @@ class MessageBubble(QtWidgets.QFrame):
 
         self.title = QtWidgets.QLabel(title)
         self.title.setObjectName("chatBubbleTitle")
+        self.title.setWordWrap(True)
+        self.title.setMinimumWidth(0)
         layout.addWidget(self.title)
 
         self.body = AutoHeightTextBrowser()
         self.body.setObjectName("chatBubbleBody")
         self.body.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.AdjustToContents)
+        self.body.setMinimumWidth(0)
         layout.addWidget(self.body)
 
         palette = {
@@ -121,6 +135,13 @@ class MessageBubble(QtWidgets.QFrame):
             self._raw_text = chunk
         self.set_text(self._raw_text)
 
+    def append_chunk(self, text: str):
+        chunk = str(text or "")
+        if not chunk:
+            return
+        self._raw_text = self._raw_text + chunk
+        self.set_text(self._raw_text)
+
 
 class ToolResultCard(QtWidgets.QFrame):
     def __init__(
@@ -142,6 +163,8 @@ class ToolResultCard(QtWidgets.QFrame):
             self._tool_result_source = text
 
         self.setObjectName("toolResultCard")
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
+        self.setMinimumWidth(0)
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(4)
@@ -151,6 +174,7 @@ class ToolResultCard(QtWidgets.QFrame):
 
         summary = QtWidgets.QLabel("Executed: %s" % (self._tool_name,))
         summary.setWordWrap(True)
+        summary.setMinimumWidth(0)
         summary.setObjectName("toolResultSummary")
         header.addWidget(summary, 1)
 
@@ -203,6 +227,10 @@ class ToolResultCard(QtWidgets.QFrame):
         if command:
             return command
         tool_name = str(metadata.get("tool_name") or "").strip()
+        if tool_name.startswith("mcp__"):
+            parts = tool_name.split("__")
+            if len(parts) >= 3 and parts[-1].strip():
+                tool_name = parts[-1].strip()
         if tool_name:
             return tool_name
         if tool_label:
@@ -284,11 +312,14 @@ class AssistantChatPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._active_ai_bubble = None
+        self._active_reasoning_bubble = None
         self._pending_tool_start = ""
         self._last_ai_text = ""
-        self._pending_ai_lines = []
+        self._pending_ai_text = ""
+        self._pending_reasoning_text = ""
         self._mode = "ai"
         self._max_visible_cards = self.MAX_VISIBLE_CARDS
+        self._agent_running = False
 
         self._ai_flush_timer = QtCore.QTimer(self)
         self._ai_flush_timer.setSingleShot(True)
@@ -322,6 +353,26 @@ class AssistantChatPanel(QtWidgets.QWidget):
         header.addWidget(self.stop_button)
 
         root.addLayout(header)
+
+        self.running_banner = QtWidgets.QFrame()
+        self.running_banner.setObjectName("chatRunningBanner")
+        running_layout = QtWidgets.QHBoxLayout(self.running_banner)
+        running_layout.setContentsMargins(8, 6, 8, 6)
+        running_layout.setSpacing(8)
+
+        self.running_label = QtWidgets.QLabel("PyMolAI is running...")
+        self.running_label.setObjectName("chatRunningLabel")
+        running_layout.addWidget(self.running_label, 0)
+
+        self.running_bar = QtWidgets.QProgressBar()
+        self.running_bar.setObjectName("chatRunningBar")
+        self.running_bar.setRange(0, 0)
+        self.running_bar.setTextVisible(False)
+        self.running_bar.setFixedHeight(6)
+        running_layout.addWidget(self.running_bar, 1)
+
+        self.running_banner.hide()
+        root.addWidget(self.running_banner, 0)
 
         self.scroll = QtWidgets.QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -368,13 +419,38 @@ class AssistantChatPanel(QtWidgets.QWidget):
             QPushButton {
                 padding: 4px 10px;
             }
+            QFrame#chatRunningBanner {
+                background: #13283a;
+                border: 1px solid #2f5878;
+                border-radius: 8px;
+            }
+            QLabel#chatRunningLabel {
+                color: #cfe7ff;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QProgressBar#chatRunningBar {
+                border: none;
+                background: #22364a;
+                border-radius: 3px;
+            }
+            QProgressBar#chatRunningBar::chunk {
+                background: #42a5f5;
+                border-radius: 3px;
+            }
             """
         )
 
     def sizeHint(self):
         return QtCore.QSize(340, 640)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_card_width_constraints()
+
     def _submit_from_input(self):
+        if self._agent_running:
+            return
         text = self.input_edit.toPlainText().strip()
         if not text:
             return
@@ -403,12 +479,23 @@ class AssistantChatPanel(QtWidgets.QWidget):
         else:
             self.input_edit.setPlaceholderText("Ask PyMolAI... (Enter to send, Shift+Enter newline)")
 
+    def set_agent_running(self, running: bool):
+        active = bool(running)
+        self._agent_running = active
+        self.running_banner.setVisible(active)
+        self.input_edit.setEnabled(not active)
+        self.send_button.setEnabled(not active)
+        if active and self.input_edit.hasFocus():
+            self.stop_button.setFocus()
+
     def clear_transcript(self):
         self._ai_flush_timer.stop()
         self._active_ai_bubble = None
+        self._active_reasoning_bubble = None
         self._pending_tool_start = ""
         self._last_ai_text = ""
-        self._pending_ai_lines = []
+        self._pending_ai_text = ""
+        self._pending_reasoning_text = ""
         while self.feed_layout.count() > 1:
             item = self.feed_layout.takeAt(0)
             widget = item.widget()
@@ -443,6 +530,7 @@ class AssistantChatPanel(QtWidgets.QWidget):
         if not text:
             return
         self._active_ai_bubble = None
+        self._active_reasoning_bubble = None
         bubble = MessageBubble("PyMOL", kind="system", markdown=False, monospace=True)
         bubble.set_text(text)
         self._append_widget(bubble)
@@ -453,23 +541,40 @@ class AssistantChatPanel(QtWidgets.QWidget):
             role = getattr(raw_role, "value", raw_role)
             role = str(role)
             text = str(getattr(event, "text", "") or "")
+            metadata = dict(getattr(event, "metadata", None) or {})
 
             if role == "ai":
-                self._append_ai_text(text)
+                if metadata.get("stream_boundary"):
+                    self._flush_pending_ai_text()
+                    self._active_ai_bubble = None
+                    continue
+                self._append_ai_text(text, is_stream_chunk=bool(metadata.get("stream_chunk")))
+                continue
+
+            if role == "reasoning":
+                self._append_reasoning_text(text, is_stream_chunk=bool(metadata.get("stream_chunk", True)))
                 continue
 
             self._flush_pending_ai_text()
-            self._active_ai_bubble = None
 
             if role == "user":
+                self._active_ai_bubble = None
+                self._active_reasoning_bubble = None
                 self._last_ai_text = ""
                 bubble = MessageBubble("You", kind="user", markdown=False)
                 bubble.set_text(text)
                 self._append_widget(bubble)
             elif role == "tool_start":
+                # End any active assistant bubble before upcoming tool output so
+                # assistant text before/after tools is rendered as separate blocks.
+                self._active_ai_bubble = None
+                self._active_reasoning_bubble = None
                 self._pending_tool_start = text
             elif role == "tool_result":
-                metadata = dict(getattr(event, "metadata", None) or {})
+                # Tool execution marks a boundary in the assistant response.
+                # Keep pre-tool and post-tool assistant text in separate bubbles.
+                self._active_ai_bubble = None
+                self._active_reasoning_bubble = None
                 if self._pending_tool_start:
                     metadata.setdefault("tool_command", self._pending_tool_start)
                 self._append_widget(
@@ -481,57 +586,80 @@ class AssistantChatPanel(QtWidgets.QWidget):
                     )
                 )
                 self._pending_tool_start = ""
-            elif role == "reasoning":
-                bubble = MessageBubble("Reasoning", kind="reasoning", markdown=False)
-                bubble.set_text(text)
-                self._append_widget(bubble)
             elif role == "error":
+                self._active_ai_bubble = None
+                self._active_reasoning_bubble = None
                 bubble = MessageBubble("Error", kind="error", markdown=False)
                 bubble.set_text(text)
                 self._append_widget(bubble)
             else:
                 if text.strip().lower() == "planning...":
                     continue
+                self._active_ai_bubble = None
+                self._active_reasoning_bubble = None
                 bubble = MessageBubble("System", kind="system", markdown=False)
                 bubble.set_text(text)
                 self._append_widget(bubble)
 
-    def _append_ai_text(self, text: str):
-        clean = str(text or "").strip()
-        if not clean:
+    def _append_ai_text(self, text: str, *, is_stream_chunk: bool = False):
+        chunk = str(text or "")
+        if not chunk:
             return
-        if not self._active_ai_bubble and clean == self._last_ai_text:
-            return
-        if self._pending_ai_lines and self._pending_ai_lines[-1] == clean:
-            return
-        if self._active_ai_bubble and self._active_ai_bubble._raw_text:
-            lines = self._active_ai_bubble._raw_text.splitlines()
-            last_line = lines[-1].strip() if lines else ""
-            if last_line == clean:
+        if not is_stream_chunk:
+            clean = chunk.strip()
+            if not clean:
                 return
+            if not self._active_ai_bubble and clean == self._last_ai_text:
+                return
+            if self._pending_ai_text == clean:
+                return
+            chunk = clean + "\n"
         if not self._active_ai_bubble:
             self._active_ai_bubble = MessageBubble("PyMolAI", kind="assistant", markdown=True)
             self._append_widget(self._active_ai_bubble)
-        self._pending_ai_lines.append(clean)
+        self._pending_ai_text += chunk
+        if not self._ai_flush_timer.isActive():
+            self._ai_flush_timer.start()
+
+    def _append_reasoning_text(self, text: str, *, is_stream_chunk: bool = True):
+        chunk = str(text or "")
+        if not chunk:
+            return
+        if not self._active_reasoning_bubble:
+            self._active_reasoning_bubble = MessageBubble("Reasoning", kind="reasoning", markdown=False)
+            self._append_widget(self._active_reasoning_bubble)
+        if is_stream_chunk:
+            self._pending_reasoning_text += chunk
+        else:
+            clean = chunk.strip()
+            if not clean:
+                return
+            if self._pending_reasoning_text:
+                self._pending_reasoning_text += "\n"
+            self._pending_reasoning_text += clean
         if not self._ai_flush_timer.isActive():
             self._ai_flush_timer.start()
 
     def _flush_pending_ai_text(self):
-        if not self._pending_ai_lines:
+        if not self._pending_ai_text and not self._pending_reasoning_text:
             return
-        if not self._active_ai_bubble:
-            self._pending_ai_lines = []
-            return
-        chunk = "\n".join(self._pending_ai_lines)
-        self._pending_ai_lines = []
-        self._active_ai_bubble.append_text(chunk)
-        lines = chunk.splitlines()
-        if lines:
-            self._last_ai_text = lines[-1].strip()
+        if self._pending_ai_text:
+            if self._active_ai_bubble:
+                chunk = self._pending_ai_text
+                self._active_ai_bubble.append_chunk(chunk)
+                lines = self._active_ai_bubble._raw_text.splitlines()
+                if lines:
+                    self._last_ai_text = lines[-1].strip()
+            self._pending_ai_text = ""
+        if self._pending_reasoning_text:
+            if self._active_reasoning_bubble:
+                self._active_reasoning_bubble.append_chunk(self._pending_reasoning_text)
+            self._pending_reasoning_text = ""
         self._scroll_to_bottom()
 
     def _append_widget(self, widget: QtWidgets.QWidget):
         self.feed_layout.insertWidget(self.feed_layout.count() - 1, widget)
+        self._update_card_width_constraints()
         self._trim_transcript_widgets()
         self._scroll_to_bottom()
 
@@ -543,12 +671,26 @@ class AssistantChatPanel(QtWidgets.QWidget):
             widget = item.widget()
             if widget is self._active_ai_bubble:
                 self._active_ai_bubble = None
+            if widget is self._active_reasoning_bubble:
+                self._active_reasoning_bubble = None
             if widget is not None:
                 widget.deleteLater()
 
     def _scroll_to_bottom(self):
         bar = self.scroll.verticalScrollBar()
         QtCore.QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
+
+    def _update_card_width_constraints(self):
+        max_width = max(160, self.scroll.viewport().width() - 2)
+        for i in range(max(0, self.feed_layout.count() - 1)):
+            item = self.feed_layout.itemAt(i)
+            if item is None:
+                continue
+            widget = item.widget()
+            if widget is None:
+                continue
+            widget.setMinimumWidth(0)
+            widget.setMaximumWidth(max_width)
 
     def history_anchor_widget(self):
         return self.history_button

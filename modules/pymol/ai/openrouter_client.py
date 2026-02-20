@@ -8,7 +8,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence
 from .message_types import ToolCall
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = "anthropic/claude-sonnet-4"
+DEFAULT_MODEL = "anthropic/claude-sonnet-4.6"
 
 
 class OpenRouterClientError(RuntimeError):

@@ -4,6 +4,20 @@ PyMOL Developer Notice
 
 Updated January 28th, 2006
 
+Fork Maintainer Addendum (PyMolAI)
+==================================
+
+This fork includes PyMolAI additions maintained by Ravi.
+Upstream PyMOL rights and trademark notices for Schrodinger, LLC remain
+as stated in LICENSE.
+Maintainer contact:
+  https://proteinlanguagemodel.com/
+  https://x.com/ravishar313
+
+For contributions that are specific to this fork's PyMolAI layer,
+preserve upstream Schrodinger attribution and clearly mark fork-specific
+changes in commit history and documentation.
+
 There are three ways in which software developers can contribute to
 the PyMOL Molecular Graphics Project.
 
@@ -75,4 +89,3 @@ the official PyMOL package, then you will need to release it under the
 (not GPL).
 
 Thanks for your participation in the PyMOL Open-Source Project!
-

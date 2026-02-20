@@ -112,6 +112,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.builder = None
         self.shortcut_menu_filter_dialog = None
         self.scene_panel_dialog = None
+        self.ai_api_key_dialog = None
 
         # setting index -> callable
         self.setting_callbacks = defaultdict(list)
@@ -266,13 +267,37 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             QtGui.QKeySequence('Ctrl+E'))
 
         ai_menu = self.menudict['Display'].addMenu('PyMolAI Settings')
-        ai_reasoning_action = ai_menu.addAction('Show Reasoning')
-        ai_reasoning_action.setCheckable(True)
+        self.ai_reasoning_action = ai_menu.addAction('Show Reasoning')
+        self.ai_reasoning_action.setCheckable(True)
+
+        self.ai_debug_action = ai_menu.addAction('Debug Mode')
+        self.ai_debug_action.setCheckable(True)
+
+        self.ai_api_key_action = ai_menu.addAction('OpenRouter API Key...')
+        self.ai_openbio_api_key_action = ai_menu.addAction('OpenBio API Key...')
+
+        ai_mode_menu = ai_menu.addMenu('Assistant Mode')
+        self.ai_mode_action_group = QtWidgets.QActionGroup(self)
+        self.ai_mode_action_group.setExclusive(True)
+        self.ai_mode_work_action = ai_mode_menu.addAction('Work')
+        self.ai_mode_work_action.setCheckable(True)
+        self.ai_mode_tutor_action = ai_mode_menu.addAction('Tutor')
+        self.ai_mode_tutor_action.setCheckable(True)
+        self.ai_mode_action_group.addAction(self.ai_mode_work_action)
+        self.ai_mode_action_group.addAction(self.ai_mode_tutor_action)
+
         runtime = self.get_ai_runtime(create=True)
         if runtime is not None:
             runtime.set_ui_mode('qt')
-            ai_reasoning_action.setChecked(bool(runtime.reasoning_visible))
-        ai_reasoning_action.toggled.connect(self.set_ai_reasoning_visible)
+        self._sync_ai_settings_menu_from_runtime()
+        self._persist_runtime_state_now()
+
+        self.ai_reasoning_action.toggled.connect(self.set_ai_reasoning_visible)
+        self.ai_debug_action.toggled.connect(self.set_ai_debug_mode)
+        self.ai_api_key_action.triggered.connect(self._open_ai_api_key_dialog)
+        self.ai_openbio_api_key_action.triggered.connect(self._open_ai_openbio_api_key_dialog)
+        self.ai_mode_work_action.toggled.connect(lambda checked: checked and self.set_ai_agent_mode('work'))
+        self.ai_mode_tutor_action.toggled.connect(lambda checked: checked and self.set_ai_agent_mode('tutor'))
 
         # extra key mappings (MacPyMOL compatible)
         QtWidgets.QShortcut(QtGui.QKeySequence('Ctrl+O'), self).activated.connect(self.file_open)
@@ -789,6 +814,86 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
     def command_set_cursor(self, i):
         return self.chat_panel.set_input_cursor(i)
 
+    def _persist_runtime_state_now(self):
+        if self._chat_store is None:
+            return
+        chat_id = getattr(self._chat_store, "current_chat_id", None)
+        if not chat_id:
+            return
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is None:
+            return
+        self._chat_store.set_runtime_state(chat_id, runtime.export_session_state())
+
+    def _sync_ai_settings_menu_from_runtime(self):
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is None:
+            return
+
+        runtime.set_ui_mode('qt')
+        reasoning = bool(runtime.reasoning_visible)
+        debug_mode = bool(runtime.trace_stream_chunks)
+        mode = str(runtime.current_agent_mode or "work").lower()
+
+        if hasattr(self, "ai_reasoning_action"):
+            self.ai_reasoning_action.blockSignals(True)
+            self.ai_reasoning_action.setChecked(reasoning)
+            self.ai_reasoning_action.blockSignals(False)
+        if hasattr(self, "ai_debug_action"):
+            self.ai_debug_action.blockSignals(True)
+            self.ai_debug_action.setChecked(debug_mode)
+            self.ai_debug_action.blockSignals(False)
+        if hasattr(self, "ai_mode_work_action") and hasattr(self, "ai_mode_tutor_action"):
+            self.ai_mode_work_action.blockSignals(True)
+            self.ai_mode_tutor_action.blockSignals(True)
+            self.ai_mode_work_action.setChecked(mode != "tutor")
+            self.ai_mode_tutor_action.setChecked(mode == "tutor")
+            self.ai_mode_work_action.blockSignals(False)
+            self.ai_mode_tutor_action.blockSignals(False)
+
+    def set_ai_reasoning_visible(self, visible):
+        pymol._gui.PyMOLDesktopGUI.set_ai_reasoning_visible(self, visible)
+        self._persist_runtime_state_now()
+        self._sync_ai_settings_menu_from_runtime()
+
+    def set_ai_debug_mode(self, visible):
+        pymol._gui.PyMOLDesktopGUI.set_ai_debug_mode(self, visible)
+        self._persist_runtime_state_now()
+        self._sync_ai_settings_menu_from_runtime()
+
+    def set_ai_agent_mode(self, mode):
+        pymol._gui.PyMOLDesktopGUI.set_ai_agent_mode(self, mode)
+        self._persist_runtime_state_now()
+        self._sync_ai_settings_menu_from_runtime()
+
+    def _on_ai_api_key_changed(self):
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            runtime.ensure_ai_default_mode(emit_notice=False)
+        self._persist_runtime_state_now()
+        self._sync_ai_settings_menu_from_runtime()
+
+    def _open_ai_api_key_dialog(self):
+        from .ai_api_key_dialog import AiApiKeyDialog
+
+        runtime = self.get_ai_runtime(create=True)
+        model = getattr(runtime, "model", None) if runtime is not None else None
+        self.ai_api_key_dialog = AiApiKeyDialog(
+            self,
+            model=str(model or ""),
+            on_changed=self._on_ai_api_key_changed,
+        )
+        self.ai_api_key_dialog.exec_()
+
+    def _open_ai_openbio_api_key_dialog(self):
+        from .ai_openbio_api_key_dialog import AiOpenBioApiKeyDialog
+
+        self.ai_openbio_api_key_dialog = AiOpenBioApiKeyDialog(
+            self,
+            on_changed=self._on_ai_api_key_changed,
+        )
+        self.ai_openbio_api_key_dialog.exec_()
+
     def update_progress(self):
         return
 
@@ -806,8 +911,10 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             if runtime.has_pending_ui_events():
                 next_feedback_ms = 0
             self.chat_panel.set_mode(runtime.current_input_mode)
+            self.chat_panel.set_agent_running(runtime.is_busy)
         else:
             self.chat_panel.set_mode("ai")
+            self.chat_panel.set_agent_running(False)
 
         feedback = self.cmd._get_feedback()
         if feedback:
@@ -834,6 +941,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         skip_overlay_size_detail = 0
         for line in lines:
             text = str(line or "")
+            if "[PyMolAI]" in text:
+                continue
             if skip_overlay_size_detail > 0:
                 if text.startswith("Image:") or text.startswith("Overlay:"):
                     skip_overlay_size_detail -= 1
@@ -851,6 +960,9 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self._chat_has_user_input = True
         self.doTypedCommand(text)
         self.pymolwidget._pymolProcess()
+        runtime = self.get_ai_runtime(create=False)
+        if runtime is not None:
+            self.chat_panel.set_agent_running(runtime.is_busy)
         self.feedback_timer.start(0)
 
     def _on_chat_clear_requested(self):
@@ -858,6 +970,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         runtime = self.get_ai_runtime(create=False)
         if runtime is not None:
             runtime.clear_session(emit_notice=False)
+            runtime.ensure_ai_default_mode(emit_notice=False)
+            self._sync_ai_settings_menu_from_runtime()
         current_id = getattr(self._chat_store, "current_chat_id", None)
         if current_id:
             self._chat_store.delete_chat(current_id)
@@ -1004,7 +1118,10 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         runtime = self.get_ai_runtime(create=True)
         if runtime is not None:
             runtime.import_session_state(runtime_state, apply_model=False)
+            runtime.reset_remote_session_binding(reason="history_chat_selected")
             mode = runtime.current_input_mode
+            self._sync_ai_settings_menu_from_runtime()
+            self._chat_store.set_runtime_state(chat_id, runtime.export_session_state())
 
         self.chat_panel.replace_transcript(events, mode)
         self._chat_has_user_input = any(str((e or {}).get("role") or "") == "user" for e in events if isinstance(e, dict))
@@ -1051,6 +1168,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         runtime = self.get_ai_runtime(create=False)
         if runtime is not None:
             runtime.clear_session(emit_notice=False)
+            runtime.ensure_ai_default_mode(emit_notice=False)
+            self._sync_ai_settings_menu_from_runtime()
         self.chat_panel.clear_transcript()
         self._chat_has_user_input = False
 
@@ -1071,6 +1190,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             runtime = self.get_ai_runtime(create=False)
             if runtime is not None:
                 runtime.clear_session(emit_notice=False)
+                runtime.ensure_ai_default_mode(emit_notice=False)
+                self._sync_ai_settings_menu_from_runtime()
             self.chat_panel.clear_transcript()
             self._chat_has_user_input = False
             self._start_new_chat_session(title_hint="")

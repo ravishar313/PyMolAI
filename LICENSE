@@ -48,3 +48,12 @@
  All other endorsements employing the PyMOL trademark require specific,
  written prior permission.
 
+ Fork Additions Notice (PyMolAI)
+ ===============================
+
+ This repository includes PyMolAI fork additions and integration work.
+ Copyright (C) Ravi.
+
+ These fork additions are distributed under the same repository license
+ terms above. Upstream PyMOL copyright and trademark notices for
+ Schrodinger, LLC remain in full effect.
