@@ -5,6 +5,8 @@ It adds provider-backed reasoning, tool execution, and optional OpenBio API gate
 
 The upstream open-source foundation remains this repository: [pymol-open-source](https://github.com/schrodinger/pymol-open-source).
 
+![PyMolAI UI](assets/UI.png)
+
 ## Feature Matrix
 
 | Capability | Status |
@@ -124,6 +126,10 @@ Important behavior:
 
 - Without OpenRouter key (`OPENROUTER_API_KEY` or `ANTHROPIC_AUTH_TOKEN`), AI mode is disabled.
 - Without OpenBio key (`OPENBIO_API_KEY`), OpenBio tools are not registered, but the rest of app behavior remains unchanged.
+
+Example scene output:
+
+![5del FMN binding site](assets/5del_FMN_binding_site.png)
 
 ## Configuration Reference
 
