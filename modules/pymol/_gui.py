@@ -912,13 +912,15 @@ class PyMOLDesktopGUI(object):
                 self.history.pop()
         self.history_cur = 0
 
-        runtime = self.get_ai_runtime(create=False)
-        if runtime is None:
-            runtime = self.get_ai_runtime(create=True)
-
         handled = False
-        if runtime is not None:
-            handled = runtime.handle_typed_input(cmmd)
+        try:
+            runtime = self.get_ai_runtime(create=False)
+            if runtime is None:
+                runtime = self.get_ai_runtime(create=True)
+            if runtime is not None:
+                handled = runtime.handle_typed_input(cmmd)
+        except Exception:
+            handled = False
 
         if not handled:
             self.cmd.do(cmmd)
@@ -926,9 +928,9 @@ class PyMOLDesktopGUI(object):
     def get_ai_runtime(self, create=True):
         try:
             from pymol.ai.runtime import get_ai_runtime
+            return get_ai_runtime(self.cmd, create=create)
         except Exception:
             return None
-        return get_ai_runtime(self.cmd, create=create)
 
     def set_ai_reasoning_visible(self, visible):
         runtime = self.get_ai_runtime(create=False)

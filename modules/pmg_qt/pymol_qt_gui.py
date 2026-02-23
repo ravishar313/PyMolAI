@@ -17,14 +17,28 @@ from pymol.Qt.utils import (getSaveFileNameWithExt, UpdateLock,
         MainThreadCaller,
         PopupOnException,
         )
-from pymol.ai.message_types import UiEvent, UiRole
-from pymol.ai.models import model_menu_entries
+try:
+    from pymol.ai.message_types import UiEvent, UiRole
+    from pymol.ai.models import model_menu_entries
+except Exception:
+    UiEvent = None  # type: ignore[assignment,misc]
+    UiRole = None  # type: ignore[assignment,misc]
+    model_menu_entries = lambda: []  # type: ignore[assignment]  # noqa: E731
 
 from .pymol_gl_widget import PyMOLGLWidget
-from .assistant_chat_panel import AssistantChatPanel
-from .ai_chat_store import AiChatStore
-from .ai_chat_history_popup import ChatHistoryPopup, ChatHistoryManagerDialog
 from . import keymapping
+
+try:
+    from .assistant_chat_panel import AssistantChatPanel
+    from .ai_chat_store import AiChatStore
+    from .ai_chat_history_popup import ChatHistoryPopup, ChatHistoryManagerDialog
+    _AI_UI_AVAILABLE = True
+except Exception:
+    AssistantChatPanel = None  # type: ignore[assignment,misc]
+    AiChatStore = None  # type: ignore[assignment,misc]
+    ChatHistoryPopup = None  # type: ignore[assignment,misc]
+    ChatHistoryManagerDialog = None  # type: ignore[assignment,misc]
+    _AI_UI_AVAILABLE = False
 
 from pmg_qt import properties_dialog, file_dialogs
 
@@ -114,6 +128,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.shortcut_menu_filter_dialog = None
         self.scene_panel_dialog = None
         self.ai_api_key_dialog = None
+        self._ext_window_visible = False
 
         # setting index -> callable
         self.setting_callbacks = defaultdict(list)
@@ -123,43 +138,59 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             lambda v: self.setWindowTitle("PyMOL (" + os.path.basename(v) + ")")
         )
 
-        # assistant chat state + command history
-        self._setup_history()
-        self.chat_panel = AssistantChatPanel(self)
-        self.chat_panel.sendCommand.connect(self._on_chat_command_submitted)
-        self.chat_panel.clearRequested.connect(self._on_chat_clear_requested)
-        self.chat_panel.stopRequested.connect(self._on_chat_stop_requested)
-        self.chat_panel.historyRequested.connect(self._on_chat_history_requested)
-        self.chat_panel.newChatRequested.connect(self._on_chat_new_requested)
-        self._chat_has_user_input = False
-        self._history_manager_dialog = None
-        self.lineedit = self.chat_panel.input_edit
-
-        self._history_popup = ChatHistoryPopup(self._list_chat_rows, self)
-        self._history_popup.chatSelected.connect(self._on_history_chat_selected)
-        self._history_popup.managerRequested.connect(self._open_history_manager)
-
-        self.ext_window = dockWidget = QtWidgets.QDockWidget(self)
-        dockWidget.setObjectName("assistant_chat_dock")
-        dockWidget.setWindowTitle("PyMolAI")
-        dockWidget.setWidget(self.chat_panel)
-        dockWidget.setAllowedAreas(Qt.LeftDockWidgetArea)
-        dockWidget.setFeatures(QtWidgets.QDockWidget.DockWidgetClosable)
-        dockWidget.resize(340, options.win_y)
-        if options.external_gui:
-            dockWidget.show()
-        else:
-            dockWidget.hide()
-
-        self.addDockWidget(Qt.LeftDockWidgetArea, dockWidget)
-
-        # OpenGL Widget
+        # OpenGL Widget (create first so PyMOL core always initializes)
         self.pymolwidget = PyMOLGLWidget(self)
         self.setCentralWidget(self.pymolwidget)
 
         cmd = self.cmd = self.pymolwidget.cmd
-        self._chat_store = AiChatStore()
-        self._start_new_chat_session(title_hint="")
+
+        # assistant chat state + command history
+        self._setup_history()
+        self._chat_has_user_input = False
+        self._history_manager_dialog = None
+        self.chat_panel = None
+        self._chat_store = None
+        self._history_popup = None
+
+        if _AI_UI_AVAILABLE and AssistantChatPanel is not None:
+            try:
+                self.chat_panel = AssistantChatPanel(self)
+                self.chat_panel.sendCommand.connect(self._on_chat_command_submitted)
+                self.chat_panel.clearRequested.connect(self._on_chat_clear_requested)
+                self.chat_panel.stopRequested.connect(self._on_chat_stop_requested)
+                self.chat_panel.historyRequested.connect(self._on_chat_history_requested)
+                self.chat_panel.newChatRequested.connect(self._on_chat_new_requested)
+                self.lineedit = self.chat_panel.input_edit
+
+                self._history_popup = ChatHistoryPopup(self._list_chat_rows, self)
+                self._history_popup.chatSelected.connect(self._on_history_chat_selected)
+                self._history_popup.managerRequested.connect(self._open_history_manager)
+            except Exception:
+                self.chat_panel = None
+                self._history_popup = None
+
+        if self.chat_panel is not None:
+            self.ext_window = dockWidget = QtWidgets.QDockWidget(self)
+            dockWidget.setObjectName("assistant_chat_dock")
+            dockWidget.setWindowTitle("PyMolAI")
+            dockWidget.setWidget(self.chat_panel)
+            dockWidget.setAllowedAreas(Qt.LeftDockWidgetArea)
+            dockWidget.setFeatures(QtWidgets.QDockWidget.DockWidgetClosable)
+            dockWidget.resize(340, options.win_y)
+            if options.external_gui:
+                dockWidget.show()
+            else:
+                dockWidget.hide()
+            self.addDockWidget(Qt.LeftDockWidgetArea, dockWidget)
+        else:
+            self.ext_window = None
+
+        try:
+            if AiChatStore is not None:
+                self._chat_store = AiChatStore()
+                self._start_new_chat_session(title_hint="")
+        except Exception:
+            self._chat_store = None
 
         '''
         # command completion
@@ -261,11 +292,13 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         menu = self.menudict['Display'].addSeparator()
         menu = self.menudict['Display'].addMenu('PyMolAI')
 
-        ext_vis_action = self.ext_window.toggleViewAction()
-        ext_vis_action.setText('Visible')
-        menu.addAction(ext_vis_action)
-        menu.addAction('Focus Input', self.chat_panel.focus_input).setShortcut(
-            QtGui.QKeySequence('Ctrl+E'))
+        if self.ext_window is not None:
+            ext_vis_action = self.ext_window.toggleViewAction()
+            ext_vis_action.setText('Visible')
+            menu.addAction(ext_vis_action)
+        if self.chat_panel is not None:
+            menu.addAction('Focus Input', self.chat_panel.focus_input).setShortcut(
+                QtGui.QKeySequence('Ctrl+E'))
 
         ai_menu = self.menudict['Display'].addMenu('PyMolAI Settings')
         self.ai_reasoning_action = ai_menu.addAction('Show Reasoning')
@@ -300,11 +333,14 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.ai_mode_action_group.addAction(self.ai_mode_work_action)
         self.ai_mode_action_group.addAction(self.ai_mode_tutor_action)
 
-        runtime = self.get_ai_runtime(create=True)
-        if runtime is not None:
-            runtime.set_ui_mode('qt')
-        self._sync_ai_settings_menu_from_runtime()
-        self._persist_runtime_state_now()
+        try:
+            runtime = self.get_ai_runtime(create=True)
+            if runtime is not None:
+                runtime.set_ui_mode('qt')
+            self._sync_ai_settings_menu_from_runtime()
+            self._persist_runtime_state_now()
+        except Exception:
+            pass
 
         self.ai_reasoning_action.toggled.connect(self.set_ai_reasoning_visible)
         self.ai_debug_action.toggled.connect(self.set_ai_debug_mode)
@@ -328,7 +364,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             'Initialize Plugin System', self.initializePlugins)
 
         # focus in command line
-        if options.external_gui:
+        if options.external_gui and self.chat_panel is not None:
             self.chat_panel.focus_input()
         else:
             self.pymolwidget.setFocus()
@@ -367,7 +403,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         '''
         Backward compatible command hook: toggle assistant chat visibility
         '''
-        self.ext_window.setVisible(not self.ext_window.isVisible())
+        if self.ext_window is not None:
+            self.ext_window.setVisible(not self.ext_window.isVisible())
 
     def toggle_fullscreen(self, toggle=-1):
         '''
@@ -378,18 +415,18 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         if toggle == -1:
             toggle = not is_fullscreen
 
-        if not is_fullscreen:
+        if not is_fullscreen and self.ext_window is not None:
             self._ext_window_visible = self.ext_window.isVisible()
 
         if toggle:
             self.menubar.hide()
-            if not self.ext_window.isFloating():
+            if self.ext_window is not None and not self.ext_window.isFloating():
                 self.ext_window.hide()
             self.showFullScreen()
             self.pymolwidget.setFocus()
         else:
             self.menubar.show()
-            if self._ext_window_visible:
+            if self._ext_window_visible and self.ext_window is not None:
                 self.ext_window.show()
             self.showNormal()
 
@@ -820,12 +857,18 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
     #################
 
     def command_get(self):
+        if self.chat_panel is None:
+            return ''
         return self.chat_panel.input_text()
 
     def command_set(self, v):
+        if self.chat_panel is None:
+            return
         return self.chat_panel.set_input_text(v)
 
     def command_set_cursor(self, i):
+        if self.chat_panel is None:
+            return
         return self.chat_panel.set_input_cursor(i)
 
     def _persist_runtime_state_now(self):
@@ -933,43 +976,52 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         return
 
     def update_feedback(self):
-        self.update_progress()
         next_feedback_ms = 500
+        try:
+            self.update_progress()
 
-        runtime = self.get_ai_runtime(create=False)
-        if runtime is not None:
-            batch_size = max(1, int(getattr(runtime, "ui_event_batch", 40)))
-            events = runtime.drain_ui_events(limit=batch_size)
-            if events:
-                self.chat_panel.append_ai_events(events)
-                self._persist_runtime_events(events, runtime)
-            if runtime.has_pending_ui_events():
-                next_feedback_ms = 0
-            self.chat_panel.set_mode(runtime.current_input_mode)
-            self.chat_panel.set_agent_running(runtime.is_busy)
-            self._sync_ai_settings_menu_from_runtime()
-        else:
-            self.chat_panel.set_mode("ai")
-            self.chat_panel.set_agent_running(False)
+            try:
+                runtime = self.get_ai_runtime(create=False)
+                if runtime is not None and self.chat_panel is not None:
+                    batch_size = max(1, int(getattr(runtime, "ui_event_batch", 40)))
+                    events = runtime.drain_ui_events(limit=batch_size)
+                    if events:
+                        self.chat_panel.append_ai_events(events)
+                        self._persist_runtime_events(events, runtime)
+                    if runtime.has_pending_ui_events():
+                        next_feedback_ms = 0
+                    self.chat_panel.set_mode(runtime.current_input_mode)
+                    self.chat_panel.set_agent_running(runtime.is_busy)
+                    self._sync_ai_settings_menu_from_runtime()
+                elif self.chat_panel is not None:
+                    self.chat_panel.set_mode("ai")
+                    self.chat_panel.set_agent_running(False)
+            except Exception:
+                pass
 
-        feedback = self.cmd._get_feedback()
-        if feedback:
-            filtered_feedback = self._filter_internal_feedback_lines(feedback)
-            if filtered_feedback and self._chat_has_user_input:
-                block = '\n'.join(str(x) for x in filtered_feedback)
-                self.chat_panel.append_feedback_block(block)
-                self._persist_feedback_block(block)
+            feedback = self.cmd._get_feedback()
+            if feedback:
+                filtered_feedback = self._filter_internal_feedback_lines(feedback)
+                if filtered_feedback and self._chat_has_user_input and self.chat_panel is not None:
+                    block = '\n'.join(str(x) for x in filtered_feedback)
+                    self.chat_panel.append_feedback_block(block)
+                    self._persist_feedback_block(block)
 
-        if self._chat_store is not None:
-            self._chat_store.pump(self._save_chat_checkpoint)
+            try:
+                if self._chat_store is not None:
+                    self._chat_store.pump(self._save_chat_checkpoint)
+            except Exception:
+                pass
 
-        for setting in self.cmd.get_setting_updates() or ():
-            if setting in self.setting_callbacks:
-                current_value = self.cmd.get_setting_tuple(setting)[1][0]
-                for callback in self.setting_callbacks[setting]:
-                    callback(current_value)
-
-        self.feedback_timer.start(next_feedback_ms)
+            for setting in self.cmd.get_setting_updates() or ():
+                if setting in self.setting_callbacks:
+                    current_value = self.cmd.get_setting_tuple(setting)[1][0]
+                    for callback in self.setting_callbacks[setting]:
+                        callback(current_value)
+        except Exception:
+            pass
+        finally:
+            self.feedback_timer.start(next_feedback_ms)
 
     @staticmethod
     def _filter_internal_feedback_lines(lines):
@@ -994,41 +1046,55 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
 
     def _on_chat_command_submitted(self, text):
         self._chat_has_user_input = True
-        self.doTypedCommand(text)
-        self.pymolwidget._pymolProcess()
-        runtime = self.get_ai_runtime(create=False)
-        if runtime is not None:
-            self.chat_panel.set_agent_running(runtime.is_busy)
+        try:
+            self.doTypedCommand(text)
+            self.pymolwidget._pymolProcess()
+            runtime = self.get_ai_runtime(create=False)
+            if runtime is not None:
+                self.chat_panel.set_agent_running(runtime.is_busy)
+        except Exception:
+            pass
         self.feedback_timer.start(0)
 
     def _on_chat_clear_requested(self):
-        self.chat_panel.clear_transcript()
-        runtime = self.get_ai_runtime(create=False)
-        if runtime is not None:
-            runtime.clear_session(emit_notice=False)
-            runtime.ensure_ai_default_mode(emit_notice=False)
-            self._sync_ai_settings_menu_from_runtime()
-        current_id = getattr(self._chat_store, "current_chat_id", None)
-        if current_id:
-            self._chat_store.delete_chat(current_id)
-        self._chat_has_user_input = False
-        self._start_new_chat_session(title_hint="")
+        try:
+            if self.chat_panel is not None:
+                self.chat_panel.clear_transcript()
+            runtime = self.get_ai_runtime(create=False)
+            if runtime is not None:
+                runtime.clear_session(emit_notice=False)
+                runtime.ensure_ai_default_mode(emit_notice=False)
+                self._sync_ai_settings_menu_from_runtime()
+            current_id = getattr(self._chat_store, "current_chat_id", None) if self._chat_store else None
+            if current_id and self._chat_store is not None:
+                self._chat_store.delete_chat(current_id)
+            self._chat_has_user_input = False
+            self._start_new_chat_session(title_hint="")
+        except Exception:
+            pass
         self.feedback_timer.start(0)
 
     def _on_chat_stop_requested(self):
-        runtime = self.get_ai_runtime(create=False)
-        if runtime is not None:
-            runtime.request_cancel()
-        self.cmd.interrupt()
+        try:
+            runtime = self.get_ai_runtime(create=False)
+            if runtime is not None:
+                runtime.request_cancel()
+            self.cmd.interrupt()
+        except Exception:
+            pass
         self.feedback_timer.start(0)
 
     def _start_new_chat_session(self, title_hint: str = ""):
+        if self._chat_store is None:
+            return
         chat_id = self._chat_store.create_chat(title_hint=title_hint)
         runtime = self.get_ai_runtime(create=False)
         if runtime is not None:
             self._chat_store.set_runtime_state(chat_id, runtime.export_session_state())
 
     def _persist_runtime_events(self, events, runtime):
+        if self._chat_store is None:
+            return
         chat_id = getattr(self._chat_store, "current_chat_id", None)
         if not chat_id:
             self._start_new_chat_session(title_hint="")
@@ -1059,6 +1125,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
     def _persist_feedback_block(self, text: str):
         if not text.strip():
             return
+        if self._chat_store is None or UiEvent is None or UiRole is None:
+            return
         chat_id = getattr(self._chat_store, "current_chat_id", None)
         if not chat_id:
             return
@@ -1073,14 +1141,20 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.cmd.save(session_path, format='pse', quiet=1)
 
     def _list_chat_rows(self, query: str, offset: int, limit: int):
+        if self._chat_store is None:
+            return []
         return self._chat_store.list_chats(query=query, offset=offset, limit=limit)
 
     def _has_unsaved_chat_work(self) -> bool:
-        if self.chat_panel.input_text().strip():
+        if self.chat_panel is not None and self.chat_panel.input_text().strip():
             return True
-        return bool(self._chat_store.has_unsaved_changes())
+        if self._chat_store is not None:
+            return bool(self._chat_store.has_unsaved_changes())
+        return False
 
     def _on_chat_history_requested(self):
+        if self._history_popup is None or self.chat_panel is None:
+            return
         self._history_popup.open_at(self.chat_panel.history_anchor_widget())
 
     def _on_history_chat_selected(self, chat_id: str):
@@ -1159,11 +1233,14 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             self._sync_ai_settings_menu_from_runtime()
             self._chat_store.set_runtime_state(chat_id, runtime.export_session_state())
 
-        self.chat_panel.replace_transcript(events, mode)
+        if self.chat_panel is not None:
+            self.chat_panel.replace_transcript(events, mode)
         self._chat_has_user_input = any(str((e or {}).get("role") or "") == "user" for e in events if isinstance(e, dict))
         self.feedback_timer.start(0)
 
     def _on_chat_new_requested(self):
+        if self._chat_store is None:
+            return
         if self._chat_store.count_chats() >= self._chat_store.soft_cap:
             box = QtWidgets.QMessageBox(self)
             box.setWindowTitle("History Soft Cap")
@@ -1206,7 +1283,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             runtime.clear_session(emit_notice=False)
             runtime.ensure_ai_default_mode(emit_notice=False)
             self._sync_ai_settings_menu_from_runtime()
-        self.chat_panel.clear_transcript()
+        if self.chat_panel is not None:
+            self.chat_panel.clear_transcript()
         self._chat_has_user_input = False
 
         if clicked == reset_scene_btn:
@@ -1216,10 +1294,14 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         self.feedback_timer.start(0)
 
     def _open_history_manager(self):
+        if ChatHistoryManagerDialog is None:
+            return
         dlg = ChatHistoryManagerDialog(self._list_chat_rows, self._delete_chat_by_id, self)
         dlg.exec_()
 
     def _delete_chat_by_id(self, chat_id: str) -> bool:
+        if self._chat_store is None:
+            return False
         was_current = chat_id == getattr(self._chat_store, "current_chat_id", None)
         deleted = self._chat_store.delete_chat(chat_id)
         if deleted and was_current:
@@ -1228,7 +1310,8 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
                 runtime.clear_session(emit_notice=False)
                 runtime.ensure_ai_default_mode(emit_notice=False)
                 self._sync_ai_settings_menu_from_runtime()
-            self.chat_panel.clear_transcript()
+            if self.chat_panel is not None:
+                self.chat_panel.clear_transcript()
             self._chat_has_user_input = False
             self._start_new_chat_session(title_hint="")
         return deleted
