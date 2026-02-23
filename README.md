@@ -135,6 +135,28 @@ Important behavior:
 - Without OpenRouter key (`OPENROUTER_API_KEY` or `ANTHROPIC_AUTH_TOKEN`), AI mode is disabled.
 - Without OpenBio key (`OPENBIO_API_KEY`), OpenBio tools are not registered, but the rest of app behavior remains unchanged.
 
+## Model Selector
+
+Model selection is available at:
+
+- `Display -> PyMolAI Settings -> Model`
+
+Supported models:
+
+- `google/gemini-3.1-pro-preview`
+- `anthropic/claude-sonnet-4.6` (default)
+- `z-ai/glm-5`
+- `minimax/minimax-m2.5`
+- `moonshotai/kimi-k2.5`
+- `google/gemini-3-flash-preview`
+- `anthropic/claude-haiku-4.5`
+
+Behavior:
+
+- The UI selector only lists and selects the supported models above.
+- `/ai model <id>` remains flexible and accepts custom model IDs.
+- If you switch model while a run is active, the current run continues and the new model applies on the next turn.
+
 Example scene output:
 
 ![5del FMN binding site](assets/5del_FMN_binding_site.png)

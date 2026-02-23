@@ -358,7 +358,7 @@ class ClaudeSdkLoop:
 
         @tool(
             "run_pymol_command",
-            "Run a single PyMOL command in the current session.",
+            "Run one or more PyMOL commands in the current session. Prefer newline-separated command blocks for multi-step changes.",
             {"command": str, "rationale": str},
         )
         async def run_pymol_command(args):

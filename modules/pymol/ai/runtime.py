@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 from .claude_sdk_loop import ClaudeSdkLoop
 from .message_types import UiEvent, UiRole
 from .openrouter_client import DEFAULT_MODEL
+from .models import is_supported_model
 from .api_key_store import load_saved_key_into_env_if_needed
 from .openbio_api_key_store import load_saved_key_into_env_if_needed as load_openbio_saved_key_into_env_if_needed
 from .openbio_client import execute_openbio_api_gateway_tool
@@ -213,6 +214,28 @@ class AiRuntime:
     @property
     def current_agent_mode(self) -> str:
         return self.agent_mode
+
+    def set_model(self, model_id: str, emit_notice: bool = True) -> str:
+        value = str(model_id or "").strip() or DEFAULT_MODEL
+        self.model = value
+        busy_now = self.is_busy
+        self._log_ai(
+            "ai model changed",
+            model=self.model,
+            busy=busy_now,
+            supported=is_supported_model(self.model),
+        )
+        if emit_notice:
+            if busy_now:
+                self.emit_ui_event(
+                    UiEvent(
+                        role=UiRole.SYSTEM,
+                        text="Model changed to %s. Change will apply on the next turn." % (self.model,),
+                    )
+                )
+            else:
+                self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="Model set to %s." % (self.model,)))
+        return self.model
 
     @property
     def is_busy(self) -> bool:
@@ -549,9 +572,7 @@ class AiRuntime:
             if len(parts) < 3:
                 self.emit_ui_event(UiEvent(role=UiRole.ERROR, text="usage: /ai model <openrouter_model_id>"))
                 return
-            self.model = parts[2]
-            self._log_ai("ai model changed", model=self.model)
-            self.emit_ui_event(UiEvent(role=UiRole.SYSTEM, text="model set to %s" % (self.model,)))
+            self.set_model(parts[2], emit_notice=True)
             return
 
         if action == "clear":

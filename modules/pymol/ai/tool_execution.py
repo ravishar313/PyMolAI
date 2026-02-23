@@ -26,27 +26,37 @@ def run_pymol_command(cmd, command: str) -> ToolExecutionResult:
     if not command:
         return ToolExecutionResult(ok=False, command=command, error="empty command")
 
+    # Allow efficient multi-command tool calls by treating newline-separated
+    # blocks as a sequence of individual PyMOL commands.
+    lines = [part.strip() for part in command.replace("\r\n", "\n").split("\n") if part.strip()]
+    subcommands = lines or [command]
+    total = len(subcommands)
+
     # Clear stale feedback so captured lines correspond to this call.
     _safe_feedback(cmd)
 
-    try:
-        result = cmd._parser.parse(command)
-    except Exception as exc:  # noqa: BLE001
-        lines = _safe_feedback(cmd)
-        return ToolExecutionResult(
-            ok=False,
-            command=command,
-            error=str(exc),
-            feedback_lines=lines,
-        )
+    all_feedback: List[str] = []
+    for i, subcommand in enumerate(subcommands, start=1):
+        try:
+            result = cmd._parser.parse(subcommand)
+        except Exception as exc:  # noqa: BLE001
+            feedback_lines = _safe_feedback(cmd)
+            all_feedback.extend(feedback_lines)
+            return ToolExecutionResult(
+                ok=False,
+                command=command,
+                error="subcommand %d/%d failed: %s" % (i, total, str(exc)),
+                feedback_lines=all_feedback,
+            )
 
-    lines = _safe_feedback(cmd)
-    if result != 1:
-        return ToolExecutionResult(
-            ok=False,
-            command=command,
-            error="parser returned failure",
-            feedback_lines=lines,
-        )
+        feedback_lines = _safe_feedback(cmd)
+        all_feedback.extend(feedback_lines)
+        if result != 1:
+            return ToolExecutionResult(
+                ok=False,
+                command=command,
+                error="subcommand %d/%d failed: parser returned failure" % (i, total),
+                feedback_lines=all_feedback,
+            )
 
-    return ToolExecutionResult(ok=True, command=command, feedback_lines=lines)
+    return ToolExecutionResult(ok=True, command=command, feedback_lines=all_feedback)

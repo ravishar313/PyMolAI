@@ -18,6 +18,7 @@ from pymol.Qt.utils import (getSaveFileNameWithExt, UpdateLock,
         PopupOnException,
         )
 from pymol.ai.message_types import UiEvent, UiRole
+from pymol.ai.models import model_menu_entries
 
 from .pymol_gl_widget import PyMOLGLWidget
 from .assistant_chat_panel import AssistantChatPanel
@@ -275,6 +276,19 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
 
         self.ai_api_key_action = ai_menu.addAction('OpenRouter API Key...')
         self.ai_openbio_api_key_action = ai_menu.addAction('OpenBio API Key...')
+
+        ai_model_menu = ai_menu.addMenu('Model')
+        self.ai_model_action_group = QtWidgets.QActionGroup(self)
+        self.ai_model_action_group.setExclusive(True)
+        self.ai_model_actions = {}
+        for model_id, friendly_name in model_menu_entries():
+            label = "%s (%s)" % (friendly_name, model_id)
+            action = ai_model_menu.addAction(label)
+            action.setCheckable(True)
+            action.setData(model_id)
+            self.ai_model_action_group.addAction(action)
+            self.ai_model_actions[model_id] = action
+            action.toggled.connect(lambda checked, m=model_id: checked and self._on_ai_model_selected(m))
 
         ai_mode_menu = ai_menu.addMenu('Assistant Mode')
         self.ai_mode_action_group = QtWidgets.QActionGroup(self)
@@ -850,6 +864,18 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
             self.ai_mode_tutor_action.setChecked(mode == "tutor")
             self.ai_mode_work_action.blockSignals(False)
             self.ai_mode_tutor_action.blockSignals(False)
+        if hasattr(self, "ai_model_actions"):
+            current_model = str(getattr(runtime, "model", "") or "").strip()
+            matched = current_model in self.ai_model_actions
+            group = getattr(self, "ai_model_action_group", None)
+            if group is not None and not matched:
+                group.setExclusive(False)
+            for model_id, action in self.ai_model_actions.items():
+                action.blockSignals(True)
+                action.setChecked(matched and model_id == current_model)
+                action.blockSignals(False)
+            if group is not None and not matched:
+                group.setExclusive(True)
 
     def set_ai_reasoning_visible(self, visible):
         pymol._gui.PyMOLDesktopGUI.set_ai_reasoning_visible(self, visible)
@@ -865,6 +891,15 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
         pymol._gui.PyMOLDesktopGUI.set_ai_agent_mode(self, mode)
         self._persist_runtime_state_now()
         self._sync_ai_settings_menu_from_runtime()
+
+    def _on_ai_model_selected(self, model_id):
+        runtime = self.get_ai_runtime(create=True)
+        if runtime is None:
+            return
+        runtime.set_model(str(model_id or ""), emit_notice=True)
+        self._persist_runtime_state_now()
+        self._sync_ai_settings_menu_from_runtime()
+        self.feedback_timer.start(0)
 
     def _on_ai_api_key_changed(self):
         runtime = self.get_ai_runtime(create=False)
@@ -912,6 +947,7 @@ class PyMOLQtGUI(QtWidgets.QMainWindow, pymol._gui.PyMOLDesktopGUI):
                 next_feedback_ms = 0
             self.chat_panel.set_mode(runtime.current_input_mode)
             self.chat_panel.set_agent_running(runtime.is_busy)
+            self._sync_ai_settings_menu_from_runtime()
         else:
             self.chat_panel.set_mode("ai")
             self.chat_panel.set_agent_running(False)

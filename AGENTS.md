@@ -18,6 +18,7 @@ Core points:
 3. Open `Display -> PyMolAI Settings -> OpenRouter API Key...` and save/test key.
 4. For OpenBio access, sign up at https://openbio.tech/ and create an OpenBio API key.
 5. Optionally open `Display -> PyMolAI Settings -> OpenBio API Key...` and save/test key.
+6. Optionally set the model from `Display -> PyMolAI Settings -> Model`.
 
 ## 3) Agent-Safe Setup Scripts
 
@@ -83,6 +84,8 @@ Environment variables:
 Behavior contract:
 - Without OpenRouter key (or Anthropic auth token mapping), AI mode is disabled.
 - Without OpenBio key, OpenBio tools are not registered, but the app still works.
+- Model selector in settings is strict to supported models; `/ai model <id>` remains flexible.
+- Changing model while busy applies to the next turn and should show a user-facing notice.
 
 Key storage:
 - UI save uses `keyring` and system keychain.

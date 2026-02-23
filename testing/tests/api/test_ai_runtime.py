@@ -219,6 +219,29 @@ def test_ai_controls_model_clear_and_mode(monkeypatch):
     assert runtime.history == []
 
 
+def test_set_model_emits_notice_when_idle(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.set_model("z-ai/glm-5", emit_notice=True)
+    assert runtime.model == "z-ai/glm-5"
+    events = _events(runtime)
+    assert any(e.role == UiRole.SYSTEM and e.text == "Model set to z-ai/glm-5." for e in events)
+
+
+def test_set_model_emits_next_turn_notice_when_busy(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    with runtime._lock:
+        runtime._busy = True
+    runtime.set_model("google/gemini-3-flash-preview", emit_notice=True)
+    with runtime._lock:
+        runtime._busy = False
+    assert runtime.model == "google/gemini-3-flash-preview"
+    events = _events(runtime)
+    assert any(
+        e.role == UiRole.SYSTEM and "Change will apply on the next turn." in e.text
+        for e in events
+    )
+
+
 def test_clear_session_api(monkeypatch):
     runtime = _runtime(monkeypatch)
     runtime.history = [{"role": "user", "content": "hello"}]
@@ -362,6 +385,25 @@ def test_sdk_path_emits_stream_and_tool_metadata(monkeypatch):
     assert "tool_command" in tool_meta
     assert "tool_result_json" in tool_meta
     assert runtime._sdk_session_id == "sess_a"
+
+
+def test_sdk_turn_uses_selected_model(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    runtime.model = "minimax/minimax-m2.5"
+    runtime.screenshot_validate_required = False
+    runtime._sdk_loop = FakeSdkLoop(
+        [
+            {
+                "assistant_text": "ok",
+                "session_id": "sess_model",
+            }
+        ]
+    )
+
+    runtime._agent_worker("hello")
+
+    assert len(runtime._sdk_loop.calls) == 1
+    assert runtime._sdk_loop.calls[0]["model"] == "minimax/minimax-m2.5"
 
 
 def test_stream_only_output_does_not_emit_missing_final_error(monkeypatch):
