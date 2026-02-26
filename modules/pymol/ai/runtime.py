@@ -806,6 +806,69 @@ class AiRuntime:
         }
 
     @staticmethod
+    def _truncate_preview_text(text: str, max_chars: int) -> str:
+        raw = str(text or "")
+        limit = max(64, int(max_chars))
+        if len(raw) <= limit:
+            return raw
+        head = max(32, int(limit * 0.7))
+        tail = max(16, limit - head - 32)
+        omitted = max(0, len(raw) - head - tail)
+        return "%s\n... [truncated %d chars] ...\n%s" % (raw[:head], omitted, raw[-tail:])
+
+    def _sdk_safe_run_command_payload(self, payload: Dict[str, object]) -> Dict[str, object]:
+        """
+        Guard against oversized MCP tool-result JSON messages. Claude SDK's
+        message reader can fail hard when a single JSON payload exceeds the
+        configured buffer (default 10 MiB).
+        """
+        limit = int(self.sdk_max_buffer_size or (10 * 1024 * 1024))
+        target = max(16_384, min(512_000, max(16_384, limit // 4)))
+
+        serialized = self._tool_result_content(payload)
+        if len(serialized) <= target:
+            return payload
+
+        trimmed = dict(payload)
+
+        command_text = str(trimmed.get("command") or "")
+        if len(command_text) > 8_192:
+            trimmed["command"] = self._truncate_preview_text(command_text, 8_192)
+            trimmed["command_truncated"] = True
+
+        error_text = str(trimmed.get("error") or "")
+        if error_text and len(error_text) > 8_192:
+            trimmed["error"] = self._truncate_preview_text(error_text, 8_192)
+
+        feedback_lines = [str(x) for x in (trimmed.get("feedback_lines") or [])]
+        if feedback_lines:
+            joined = "\n".join(feedback_lines)
+            preview_budget = max(4_096, min(128_000, target // 2))
+            trimmed["feedback_lines"] = [
+                "[tool output truncated to avoid SDK message overflow]",
+                "original_feedback_lines=%d original_feedback_chars=%d" % (
+                    len(feedback_lines),
+                    len(joined),
+                ),
+                self._truncate_preview_text(joined, preview_budget),
+            ]
+        else:
+            trimmed["feedback_lines"] = ["[tool output omitted: payload exceeded SDK buffer target]"]
+
+        trimmed["truncated"] = True
+        trimmed["truncation_reason"] = "sdk_buffer_guard"
+
+        # Last-resort clamp if command/error fields are still too large.
+        serialized = self._tool_result_content(trimmed)
+        if len(serialized) > target:
+            trimmed["feedback_lines"] = ["[tool output omitted: exceeded SDK transport limit]"]
+            trimmed["command"] = self._truncate_preview_text(str(trimmed.get("command") or ""), 2_048)
+            if trimmed.get("error"):
+                trimmed["error"] = self._truncate_preview_text(str(trimmed.get("error") or ""), 2_048)
+
+        return trimmed
+
+    @staticmethod
     def _normalized_command_key(command: str) -> str:
         return re.sub(r"\s+", " ", str(command or "").strip().lower())
 
@@ -923,6 +986,14 @@ class AiRuntime:
                     "error": exec_result.error or None,
                     "feedback_lines": exec_result.feedback_lines,
                 }
+                payload = self._sdk_safe_run_command_payload(payload)
+                if payload.get("truncated"):
+                    self._log_ai(
+                        "tool run payload truncated for sdk transport",
+                        level="WARNING",
+                        tool_call_id=tool_call_id,
+                        command=command,
+                    )
                 metadata = {
                     "tool_call_id": tool_call_id,
                     "tool_name": "run_pymol_command",
