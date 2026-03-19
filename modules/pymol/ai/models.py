@@ -4,16 +4,38 @@ from typing import List, Tuple
 
 DEFAULT_MODEL = "anthropic/claude-sonnet-4.6"
 
+# Provider prefixes for routing
+PROVIDER_OPENROUTER = "openrouter"
+PROVIDER_ZHIPUAI = "zhipuai"
+
 SUPPORTED_MODELS: Tuple[Tuple[str, str], ...] = (
+    # OpenRouter models
     ("google/gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview"),
     ("anthropic/claude-sonnet-4.6", "Claude Sonnet 4.6"),
-    ("z-ai/glm-5", "GLM-5"),
+    ("z-ai/glm-5", "GLM-5 (OpenRouter)"),
     ("minimax/minimax-m2.5", "MiniMax M2.5"),
     ("moonshotai/kimi-k2.5", "Kimi K2.5"),
     ("google/gemini-3-flash-preview", "Gemini 3 Flash Preview"),
     ("anthropic/claude-haiku-4.5", "Claude Haiku 4.5"),
-    ("openai/gpt-5.2", "GPT-5.2")
+    ("openai/gpt-5.2", "GPT-5.2"),
+    # Z.AI Coding-Plan models (direct access)
+    ("zhipuai/GLM-5", "GLM-5 (Z.AI Coding Plan)"),
+    ("zhipuai/GLM-5-Turbo", "GLM-5-Turbo (Z.AI Coding Plan)"),
+    ("zhipuai/GLM-4.7", "GLM-4.7 (Z.AI Coding Plan)"),
+    ("zhipuai/GLM-4.6", "GLM-4.6 (Z.AI Coding Plan)"),
+    ("zhipuai/GLM-4.5", "GLM-4.5 (Z.AI Coding Plan)"),
+    ("zhipuai/GLM-4.5-Air", "GLM-4.5-Air (Z.AI Coding Plan)"),
 )
+
+# Z.AI Coding-Plan model ID mapping (prefix -> actual model name)
+ZHIPUAI_MODEL_MAP = {
+    "zhipuai/GLM-5": "GLM-5",
+    "zhipuai/GLM-5-Turbo": "GLM-5-Turbo",
+    "zhipuai/GLM-4.7": "GLM-4.7",
+    "zhipuai/GLM-4.6": "GLM-4.6",
+    "zhipuai/GLM-4.5": "GLM-4.5",
+    "zhipuai/GLM-4.5-Air": "GLM-4.5-Air",
+}
 
 
 def supported_model_ids() -> List[str]:
@@ -34,3 +56,12 @@ def is_supported_model(model_id: str) -> bool:
 def canonical_default_model() -> str:
     return DEFAULT_MODEL
 
+
+def is_zhipuai_model(model_id: str) -> bool:
+    candidate = str(model_id or "").strip()
+    return candidate.startswith("zhipuai/")
+
+
+def get_zhipuai_model_name(model_id: str) -> str:
+    candidate = str(model_id or "").strip()
+    return ZHIPUAI_MODEL_MAP.get(candidate, candidate.replace("zhipuai/", ""))
